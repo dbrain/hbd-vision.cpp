@@ -87,6 +87,18 @@
 #     Worst case 7.5+4.5 ~= 12GB -> NOTHING fits (even sub-1GB), needs gating/evict-timing.
 #     Common case (resident only, ungated slot ~4.5GB free): matting 1294/1440 ALREADY fits.
 #     => VRAM returns are diminishing; 1294-1440 is good-enough for the realistic ungated slot.
+#   F16 ENCODER PROGRESS (2026-05-31): additive F16 in/out landed in dbrain/ggml for the
+#     transformer F32-locked islands — NORM/RMS/L2_NORM, SOFT_MAX, SCALE (4b0d597d) — float
+#     internal math, F32 path BYTE-IDENTICAL (matting FA-off PSNR=inf vs pre-change). Fleet
+#     win (LLM can use them). BUT threading F16 through Swin is still BLOCKED: the encoder's
+#     big remaining buffer is the MLP hidden [768,65536] which is a MUL_MAT *output*, and
+#     ggml hardcodes mul_mat dst = F32. Casting that to F16 churns (F32+F16 both live ->
+#     no peak win). => the gating prereq is **F16 mul_mat OUTPUT** (a core ggml change).
+#     ggml-org is building exactly this (discussion #19505: configurable F16 intermediate
+#     precision for the activation path) — TRACK/BORROW from upstream rather than fork-hack
+#     the most-used op. Once mul_mat can emit F16, thread F16 from patch_embed (cast conv
+#     output F16) through the blocks (norm/softmax/scale/gelu/add all F16-ready now) and
+#     measure the encoder floor drop. THIS is the remaining matting sub-1GB lever.
 #   SUB-1GB PATHS (all deliberate, multi-day, NOT done; pick in this order):
 #     (0) Swin-encoder FA via per-head-mask fattn.cu + head_dim<64 zero-pad (NEW, best:
 #         attacks the 1290 floor, fleet-wide VRAM+perf, additive to ggml). Est: removes the
