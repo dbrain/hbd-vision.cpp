@@ -1,169 +1,154 @@
 # BiRefNet / RMBG-2.0 matting — GPU PEAK VRAM decomposition & reduction
 
-Goal: cut GPU **peak** VRAM (deploy = worker-isolated lazy-evict GPU service; it must fit in
-the free-VRAM window when the heavy GPU services are resident). Latency is NOT a concern
-(CPU alternative is 9.9 s; current GPU 695 ms has huge headroom).
+Goal: cut GPU **peak** VRAM. Deploy = worker-isolated lazy-evict GPU service that must fit the
+free-VRAM window when the heavy GPU services are concurrently resident. Latency is NOT a
+concern (CPU alternative 9.9 s; GPU has huge headroom), so trading latency for VRAM is a win.
 
 Box: RTX 3060 (12 GB) + Ryzen 5 5600X. Model `RMBG-2.0-F16.gguf` (1024 native).
 Build: flux2-dev:builder, static, GGML_CUDA, sm86. ggml submodule @ af69870.
+Measurement: `bench/measure_vram.sh` — runs one inference in a named container, polls
+`nvidia-smi --query-compute-apps=used_memory` for the peak, host-ffmpeg YAVG of the output
+(NOTE the matte is a gray PNG → signalstats needs `format=yuv444p`, not `format=gray`).
+Peaks reproduced across reps (3606/3606, 3072/3072) — stable, not jitter.
 
-Verified starting point (prior sessions): GPU @1024 ~695 ms, matte YAVG ~181,
-resident-after-load 524 MiB, **peak VRAM ~3580 MiB (nvidia-smi)**. The ~3 GB delta over the
-524 MiB resident is TRANSIENT inference scratch.
-
----
-
-## PHASE 1 — decomposition of the transient scratch (from `bench/prof_gpu.csv`)
-
-Method: the per-op profiler (`VISP_PROFILE_OPS`) dumps each node's **dst** ne dims. For
-im2col-based convs the IM2COL node's *dst* IS the materialised `[IC·KH·KW, OH·OW]` scratch
-matrix — exactly the transient buffer we care about. Bytes = product(ne)·4 (F32).
-ggml's gallocr reuses buffers, so **peak ≈ the largest single concurrent buffer + live
-activations**, NOT the sum. The single biggest buffer therefore sets the floor.
-
-Stage boundary (PROFILE.md): encoder = idx < 3403, decoder (ASPP+deform) = idx ≥ 3403.
-
-### Top transient buffers (all are IM2COL, ALL in the ENCODER)
-
-| idx | op | dst ne | MiB | what |
-|-----|----|--------|-----|------|
-| **179** | IM2COL | [4608, 65536] | **1152.0** | enc conv IC=512 k=3 @256×256 → out 384ch. **THE peak driver.** |
-| 176 | IM2COL | [1152, 65536] | 288.0 | enc conv IC=128 k=3 @256×256 → out 192ch |
-| 9   | IM2COL | [48, 1048576] | 192.0 | patch_embed k=4 IC=3 @1024×1024 (1048576=1024²) |
-| (decoder per-block IM2COL, idx≥1188) | IM2COL | [4608,16384] etc | 288.0 each (×4) | — see note below |
-
-IM2COL by size class (count × MiB-each):
-- 1152 MiB ×1  (idx 179)            = 1152 MiB
-- 288  MiB ×4                        = 1152 MiB
-- 144  MiB ×4                        =  576 MiB
-- 128  MiB ×4                        =  512 MiB
-- 72   MiB ×4                        =  288 MiB
-- 36   MiB ×6, 9 MiB ×2, ≤2 MiB tail
-- **IM2COL dst total across 47 nodes = 5072 MiB** (NOT concurrent — gallocr reuses).
-
-Decoder (idx ≥ 3403): the **largest single buffer is only ~16 MiB** (CONT/CONV_2D/CONCAT at
-256×256×64ch). The decoder convs run on the deform CUDA kernel + the 1×1 mul_mat path; they
-do **not** materialise any large im2col matrix. **The decoder is NOT a VRAM problem.**
-
-### KEY FINDING — overturns the task's stated hypothesis
-
-The task brief hypothesised the VRAM hogs are the **decoder** high-res/high-channel k>1 convs
-(the `whcn` branch in `nn.cpp conv_2d`). **That is wrong.** Measured:
-
-- The peak is dominated by **ONE buffer: idx 179 = 1152 MiB**, an **encoder** conv im2col at
-  full 256×256 spatial × IC=512 × k=3, plus idx 176 (288 MiB) and idx 9 (192 MiB), also encoder.
-- These encoder convs go through the **`cwhn`** branch of `conv_2d` (line 104–108:
-  `ggml_cont(permute) → ggml_conv_2d → ggml_cont(permute)`), because `patch_embed` sets the
-  `cwhn` flag for the whole Swin encoder.
-- The **decoder** (the `whcn` branch the task pointed at) tops out at ~16 MiB/buffer — reverting
-  it to direct would save ~nothing.
-
-So the lever is in the **`cwhn`** branch (encoder), specifically the few full-resolution k>1
-convs whose im2col matrix is huge. Routing those through `ggml_conv_2d_direct` (no im2col,
-streams the conv) removes the 1152/288/192 MiB buffers at a small latency cost.
-
-### Peak-vs-resolution curve (MEASURED, nvidia-smi per-process peak)
-
-| process_res | peak MiB | wall ms | YAVG | note |
-|-------------|----------|---------|------|------|
-| 512  | 1592 | 358  | 183.96 | quality shift (segmentation differs) |
-| 768  | 1592 | 400  | 167.80 | same gallocr bucket as 512; quality shift |
-| **1024** | **3596** | **689** | **181.09** | native default — the deploy target |
-| 1536 | 4666 | 1207 | 180.62 | — |
-| 2048 | 8862 | ~8800 | 180.62 | — |
-
-Peak scales steeply with resolution (≈ activation area). Lowering res WOULD cut peak
-(3596→1592 at ≤768) but it is a real quality tradeoff (768 YAVG 167.8 = the segmentation
-decisions shift, not just edges — see RESULTS.md CPU pass). The deploy needs full-quality
-**1024**, so resolution is NOT the lever we want; the im2col-buffer lever (Phase 3) keeps 1024.
-
-Baseline @1024 reconfirmed THIS pass: **peak 3596 MiB, 691 ms, YAVG 181.090** (matches prior
-3580/695). Resident-after-load 524 MiB (prior). => ~3.07 GB of the 3.6 GB peak is transient.
+Baseline reconfirmed THIS pass @1024: **peak 3606 MiB, 695 ms, YAVG 181.090** (matches prior
+~3580/695). Resident-after-load 524 MiB (prior sessions; deploy is lazy-load). => ~3.08 GB of
+the 3.6 GB peak is transient compute scratch + activations.
 
 ---
 
-## PHASE 2 — free savings & the structural floor
+## PHASE 1 — decomposition (real per-op dst sizes, `bench/prof_gpu.csv`)
 
-The im2col lever (Phase 3) turned out to ALSO be the "free" win: routing the big-im2col
-convs to the streaming `ggml_conv_2d_direct` kernel is **bit-identical** (MAD=0.0000, max=0
-on all 3 test images, def-path vs im2col-path — see `bench/diff_mattes.py`) and costs only
-~20 ms (~691→~712 ms). So it is effectively free for this latency-insensitive deploy.
+Method: the `VISP_PROFILE_OPS` profiler dumps each node's **dst** ne dims; bytes = Πne·4 (F32).
+ggml's gallocr reuses buffers, so **peak ≈ the largest concurrent live set**, not the sum.
 
-Why peak is NOT just "the largest single buffer": the threshold sweep proves gallocr reuse.
-- Pushing the 1152 MiB buffer (idx 179) to direct alone (threshold 256–1000) left peak at
-  **3596** — that buffer was already being reused, it did not set the peak.
-- Peak only dropped (to **2524**) once the threshold fell to **≤160 MiB**, i.e. once the
-  192 MiB patch_embed im2col (idx 9, the 1024×1024 conv) was also pushed to direct. That
-  192 MiB buffer is the marginal one that sets the high-water mark of the concurrent set.
-- Below 160 MiB the peak is **flat at 2524** all the way down to 4 MiB (latency keeps rising).
+### Top transient buffers — they are the DECODER OUTPUT HEAD, not im2col
 
-=> The remaining **2524 MiB floor is STRUCTURAL**, not im2col. With the big im2col buffers
-gone, the largest single remaining buffer is only ~192 MiB (and ≤16 MiB in the decoder), yet
-peak is 2524 — so peak is the **sum of many concurrent live activations**, dominated by the
-Swin-L encoder feature pyramid kept resident for the decoder's lateral skip connections, plus
-the two encoder passes (full-res + half-res, BiRefNet's multi-scale design — no scratch
-sharing possible without changing the output, confirmed in RESULTS.md). Compute-buffer
-working set ≈ 2524 − ~524 resident ≈ ~2000 MiB; PyTorch fp16's compute working set is
-comparable (~1818 MiB). gallocr is NOT meaningfully over-reserving — no free slop to reclaim.
+| idx | op | dst ne | MiB | stage |
+|-----|----|--------|-----|-------|
+| **4015** | CONCAT  | [1024,1024,240] | **960** | final full-res feature concat |
+| **4006** | UPSCALE | [1024,1024,192] | **768** | upsample features to 1024² |
+| 3996 | CONCAT  | [256,256,1280]  | 320 | decoder block concat |
+| 4007 | CONV_2D | [1024,1024,64]  | 256 | full-res output conv |
+| 4010 | ADD     | [1024,1024,64]  | 256 | |
+| 3986 | CONCAT  | [256,256,1024]  | 256 | |
+| 4011 | CONV_2D | [1024,1024,48]  | 192 | full-res output conv |
+| 3966 | CONCAT  | [256,256,768]   | 192 | |
+| (enc) 55/121 | MUL_MAT | [144,144,6,484] | 230 | Swin attention scores |
 
-## PHASE 3 — im2col threshold sweep (VISP_IM2COL_MAX, MiB of the F32 im2col matrix)
+**These are genuine activation tensors at the 1024×1024 output resolution — NOT im2col
+scratch.** The peak is dominated by BiRefNet's decoder head, which concatenates the
+multi-scale feature pyramid and upscales it to full 1024² (up to 240 channels). The 960 MiB
+CONCAT + 768 MiB UPSCALE being live near-simultaneously sets the floor.
 
-All @1024, GPU, FA off, cat-and-hat. peak = nvidia-smi per-process. (`bench/measure_vram.sh`.)
+### im2col is a SECONDARY contributor, not the peak driver
 
-| VISP_IM2COL_MAX | peak MiB | wall ms | YAVG | note |
-|-----------------|----------|---------|------|------|
-| 0 (disabled / always im2col) | **3596** | 701 | 181.090 | legacy baseline |
-| 1000 | 3596 | 708 | 181.090 | only 1152 buf → direct; no peak change (reused) |
-| 256  | 3596 | 719 | 181.090 | knee not yet crossed |
-| 200  | 3596 | 706 | 181.090 | |
-| **160**  | **2524** | 710 | 181.090 | **knee** — patch_embed (192 MiB) now direct |
-| **128 (DEFAULT)** | **2524** | 713 | 181.090 | chosen default (comfortably past knee) |
-| 64   | 2524 | 730 | 181.090 | |
-| 32   | 2524 | 735 | 181.090 | |
-| 16   | 2524 | 760 | 181.090 | latency rising, no further VRAM gain |
-| 8    | 2524 | 792 | 181.090 | |
-| 4    | 2524 | ~800 | 181.090 | floor; everything on direct |
+Only **2 IM2COL nodes exist** in the entire graph (idx 9 = 12 MiB patch_embed, idx 177 =
+3 MiB) — the Swin encoder convs are strided/tiny-kernel and do not blow up im2col. The
+decoder's k>1 convs DO route through `ggml_conv_2d` (im2col+mul_mat) via the `whcn` branch;
+their transient im2col matrices are the ~534 MiB the lever below removes — but gallocr reuses
+them against the larger decoder-head activations, so removing them lowers the floor by exactly
+that 534 MiB, not to ~1 GB.
 
-**Chosen knee / default = 128 MiB.** Past the knee (≤160) for a solid 2524, with maximal
-latency headroom. Catches patch_embed (192), the 1152 encoder conv, and decoder 288/144
-convs; leaves the cheap small convs on the faster im2col path.
+⚠️ Correction to an earlier draft of this file: it claimed a 1152 MiB "idx-179 encoder
+IM2COL" peak driver and a 2524 MiB floor — BOTH WRONG (idx 179 is a 48-elem RESHAPE; there is
+no 1152 MiB IM2COL node; the measured floor is 3072). All numbers below are re-measured.
 
-Bit-exactness gate (default 128 vs disabled 0), all 3 test images:
-`cat-and-hat MAD=0.0000 max=0 | vase-and-bowl MAD=0.0000 max=0 | wardrobe MAD=0.0000 max=0`.
-YAVG 181.090 == baseline. Direct-conv and im2col+mul_mat compute the identical convolution.
+### Peak-vs-resolution curve (MEASURED, nvidia-smi per-process peak, baseline build th=0)
+
+| process_res | peak MiB | note |
+|-------------|----------|------|
+| 512  | 1308 | quality shift (segmentation differs; not lossless) |
+| 768  | 2288 | quality shift |
+| **1024** | **3606** | native default — the deploy target |
+| 1536 | 7530 | |
+| 2048 | 11542 | nearly fills the 12 GB card |
+
+Peak scales ~quadratically with res (activation area). Dropping to 768 hits ~2.3 GB but shifts
+segmentation decisions (YAVG 768 ≈ 167.8, RESULTS.md) — a real quality tradeoff, not lossless.
+Deploy needs full-quality 1024, so res is not the lossless lever.
+
+---
+
+## PHASE 2 — free / near-lossless savings
+
+The im2col→direct reroute (Phase 3) is the main win for −534 MiB. Quality (default th=128 vs
+disabled th=0, measured by ffmpeg PSNR + md5, all 3 test images):
+- **wardrobe:      PSNR 67.4 dB**
+- **cat-and-hat:   PSNR 54.5 dB**, YAVG 181.090→181.083, visually identical clean silhouette
+  (both Read — `q0_*` vs `q128_*`)
+- **vase-and-bowl: PSNR 44.1 dB** (the noisiest, still well above any perceptual threshold)
+- md5 differs on all 3 → **near-lossless, NOT strictly bit-exact**.
+
+`ggml_conv_2d_direct` and the im2col+`ggml_mul_mat` path differ in F16-weight handling / FP
+accumulation order; this surfaces as sub-perceptual edge noise (PSNR 44–67 dB). It passes the
+correctness gate (YAVG ~181 + clean silhouette) on all 3, but do NOT claim bit-identity.
+
+No gallocr over-reservation was found beyond this: with the im2col matrices gone the floor is
+the decoder-head activation set (Phase 1), which is real output data, not reclaimable scratch.
+The two Swin encoder passes (full + half res) are BiRefNet's multi-scale design — no activation
+sharing possible without changing the output (RESULTS.md). No further zero-cost VRAM available.
+
+## PHASE 3 — im2col threshold sweep (`VISP_IM2COL_MAX`, MiB of the F32 im2col matrix)
+
+conv_2d() routes a k>1 conv to the streaming `ggml_conv_2d_direct` kernel (no im2col buffer)
+when its im2col matrix [IC·KH·KW, OH·OW] would exceed VISP_IM2COL_MAX; else im2col+mul_mat.
+All @1024, GPU, FA off, cat-and-hat. peak = nvidia-smi per-process (2+ reps, stable).
+
+| VISP_IM2COL_MAX | peak MiB | wall ms | YAVG (cat) | quality vs th=0 |
+|-----------------|----------|---------|------------|-----------------|
+| 0 (disabled / always im2col) | **3606** | 695 | 181.090 | baseline |
+| 128 (DEFAULT)   | **3072** | 717 | 181.083 | PSNR 44–67 dB (per image), visually identical |
+| 64              | 3072 | 730 | 181.083 | |
+| 16              | 3072 | 764 | 181.083 | |
+| 4               | 3072 | 801 | 181.083 | |
+| 1               | 3072 | 809 | 181.083 | |
+
+**Floor is 3072 MiB, reached at threshold ≤128 and FLAT all the way down to 1** (more convs go
+direct, latency keeps rising, VRAM does not drop further — proves the remaining peak is the
+decoder-head activations, not im2col). **Chosen default = 128 MiB**: past the knee for the full
+−534 MiB with maximal latency headroom; catches the decoder's high-res k>1 convs, leaves the
+cheap small ones on the faster im2col path. `VISP_IM2COL_MAX=0` disables it.
 
 ### FINAL VERIFIED NUMBERS (default build, no env)
-- GPU @1024: **peak 2524 MiB** (was 3596), **713 ms** (was 691), YAVG **181.090**, bit-exact.
-- `VISP_IM2COL_MAX=0` restores 3596 MiB / 701 ms (knob verified both directions).
-- Resident-after-load unchanged at 524 MiB (weights + CUDA ctx; the lever only touches scratch).
+- GPU @1024: **peak 3072 MiB** (was 3606), **~717 ms** (was 695), YAVG **181.083** (cat) —
+  passes gate (YAVG ~181 + clean silhouette); near-lossless (PSNR 44–67 dB), NOT bit-identical.
+- `VISP_IM2COL_MAX=0` restores 3606 MiB / 695 ms / YAVG 181.090 (knob verified both directions,
+  repeatable).
+
+---
 
 ## FINAL — honest ceiling
 
-- **Banked: GPU peak 3596 → 2524 MiB (−1072 MiB / −30%)** at full 1024 quality, bit-identical
-  matte, ~free latency (+22 ms). Now **below PyTorch fp16's 2840 MiB peak**, and our resident
-  (524) is already half of PyTorch's (1022). Shipped as the compiled default (env-tunable).
-- **2524 MiB is the floor for this class of lever.** It is structural: the concurrent Swin-L
-  encoder activation pyramid (multi-scale skip connections + the two encoder passes). The
-  largest remaining single buffer is ~192 MiB; the rest is the live activation set. gallocr is
-  not over-reserving (compute working set ~2000 MiB ≈ PyTorch's). No more free/lossless VRAM.
-- **~1–1.5 GB is NOT reachable losslessly at 1024.** The only routes below ~2.5 GB:
-  1. **Lower process_res** — 512/768 give peak **1592 MiB** (measured) but shift the
-     segmentation (quality tradeoff, not lossless; YAVG 768=167.8). Opt-in `process_res`
-     already exists; viable if a request accepts lower fidelity. The hard ~1.5 GB target is
-     met ONLY at reduced resolution.
-  2. **F16 activations (Phase 4, NOT implemented — flagged):** the ~2000 MiB compute working
-     set is F32. Halving activation precision to F16 would roughly halve it → estimated GPU
-     peak ≈ **524 + ~1000 ≈ ~1.5 GB** at 1024. This is the one path to ~1.5 GB at full
-     resolution. BUT it is a big, risky **shared-ggml** change (many ggml ops would need an
-     F16-activation path; per RESULTS.md the F16 path SIGSEGVs today and several ops assume
-     F32), with real quality risk (F16 accumulation in the decoder ASPP/deform, which already
-     "explodes to inf" on type mismatch). Estimate only — do NOT attempt without explicit
-     sign-off and a proper per-op F16 audit + bit/MAD gate.
+- **Banked: GPU peak 3606 → 3072 MiB (−534 MiB / −15%)** at full 1024 resolution, near-lossless
+  matte (YAVG 181.083 cat; PSNR 44–67 dB; sub-perceptual edge noise; passes YAVG~181 +
+  clean-silhouette gate), ~22 ms latency cost. Shipped as the compiled default, env-tunable.
+- **3072 MiB is the floor for any im2col/scratch lever.** The peak is NOT im2col scratch — it is
+  the BiRefNet **decoder output head**: a 960 MiB CONCAT [1024,1024,240] + 768 MiB UPSCALE
+  [1024,1024,192] + several 256/192 MiB full-res convs, all genuine F32 activations at the 1024²
+  output. gallocr is not over-reserving; these are real intermediate results. (PyTorch fp16 peak
+  is 2840; we are now within ~230 MiB of it and our resident 524 is half PyTorch's 1022.)
+- **~1–1.5 GB is NOT reachable losslessly at 1024.** Honest options below 3072:
+  1. **Lower process_res** — measured 768→2288 MiB, 512→1308 MiB, but shifts segmentation
+     (quality tradeoff, not lossless). Opt-in `process_res` already exists. The hard ~1.5 GB
+     target is met only at ≤768 res with reduced fidelity.
+  2. **F16 activations (Phase 4 — NOT implemented, flagged):** the entire decoder-head working
+     set is F32. Halving activation precision to F16 would ~halve the dominant buffers
+     (960→480, 768→384, …), estimated GPU peak ≈ **~1.7–2.0 GB** at 1024. This is the only
+     lossless-at-1024 path under ~2.5 GB. BUT it is a large, risky **shared-ggml** change: many
+     ops (CONCAT/UPSCALE/CONV_2D/ADD + the ASPP/deform decoder, which already explodes to inf on
+     a type mismatch — RESULTS.md) would need a vetted F16-activation path; the F16 path SIGSEGVs
+     today and several ops assume F32. Real numerical-quality risk in the F16-accumulating
+     decoder. Estimate only — do NOT attempt without explicit sign-off, a per-op F16 audit, and a
+     bit/MAD gate. Even then it lands ~1.7 GB, not necessarily ≤1.5 GB.
+  3. **Tile the decoder head** (compute the 1024² output in spatial strips) — would cut the
+     960/768 MiB buffers proportionally, lossless, but is a real birefnet.cpp restructure of the
+     output stage. Not attempted; flagged as the highest-value next lever if <2.5 GB is required.
 
 ### Deploy implication
-At 2524 MiB peak (worker-isolated, true-0 when evicted), the matting worker fits the
-free-VRAM window far more comfortably than the old 3596 — a −1072 MiB safety margin against
-OOM when the heavy GPU services are concurrently resident, with zero quality or meaningful
-latency cost. Default is baked in; `VISP_IM2COL_MAX` lets ops trade latency for even more VRAM
-headroom if a future tighter window demands it (peak stays 2524 but the knob is there).
-
+At **3072 MiB peak** (worker-isolated, true-0 when evicted) the matting worker has a −534 MiB
+safety margin vs the old 3606 against OOM when the heavy GPU services are resident, at near-zero
+quality and ~zero latency cost. Default baked in; `VISP_IM2COL_MAX` is there if a future tighter
+window wants more (peak stays 3072 — no further gain past the knee). If the free-VRAM window is
+ever < ~3 GB, the only routes are reduced process_res (lossy) or the F16-activations /
+decoder-tiling work above (large, flagged, not done).
