@@ -265,3 +265,56 @@ speed/quality *tradeoff* the user opts into per request, NOT free speed. Default
   real lever, deferred as it needs the conv2d_weights-index plumbing.
 - ggml UNTOUCHED: ~/dev/ggml and depend/ggml both @ af69870c, 0 dirty (all changes vision.cpp-side:
   birefnet.cpp VISP_BIREFNET_RES + ml.cpp thread default = physical cores + VISP_CPU_THREADS).
+
+## CPU LOSSLESS PERF PASS #2 — 2026-05-30 (no win found; F16-weights crashes, OpenBLAS slower)
+Host: Ryzen 5 5600X (Zen3, 6c/12t), builder flux2-dev:builder, 6 threads default.
+Baseline reproduced THIS pass (2 runs): F32-CPU @1024 = 9893 / 9951 ms, YAVG 180.974,
+clean cat+hat silhouette. Matches PROFILE.md's 9.89s. ggml af69870c (both trees in sync).
+Goal: faster CPU at ZERO quality loss (no quant). Both candidate lossless levers FAILED.
+
+### DEAD — F16 weights on CPU (VISP_CPU_F16=1): SEGFAULTS at load, reverted
+Tried preferred_float_type() returning GGML_TYPE_COUNT for CPU when VISP_CPU_F16=1, so the
+RMBG-2.0-F16.gguf keeps native F16 weights (idea: ggml CPU MUL_MAT upcasts F16->F32 per op,
+lossless, but halves weight BW on the BW-bound Swin GEMMs). Built clean (ml.cpp.o recompiled,
+binary relinked, grep-confirmed). Result: **SIGSEGV (exit 139)** during model load — the run
+dies right after "found 1 CUDA devices", before "Initializing backend... done" / weight load
+finishes. Root cause: the CPU path uses preferred_layout()==cwhn, and the whcn->cwhn weight
+conversion + several CPU ops are written assuming F32 weights (same class of failure the handoff
+documented for the F32-keep rationale: "not all operations support F16"). Making it work would
+need a deep per-op F16 audit in the shared correctness path — out of scope / high risk. Edit
+REVERTED (ml.cpp == committed HEAD, grep VISP_CPU_F16 == 0). No degraded matte shipped, no
+fabricated number kept. (NOTE: an earlier draft of this section claimed "8688 ms, lossless" —
+that was WRONG, carried over from a cancelled command batch; the lever actually crashes.)
+
+### DEAD — OpenBLAS (GGML_BLAS=ON / OpenBLAS): measured ~2% SLOWER, do not deploy
+Built throwaway flux2-dev:builder-blas (apt libopenblas-dev) + separate build-blas dir with
+-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS (CMake: "Found BLAS: .../libopenblas.so",
+"Including BLAS backend"). Prod build dir untouched.
+  BLAS F32-CPU (3 runs): 10128 / 10116 / 10110 ms, YAVG 180.974 (correct).
+  vs baseline 9893 / 9951 ms  =>  ~+2% SLOWER.
+Confirms the flux2 lap-5/6 / memory finding: on Zen3 ggml's own AVX2 MMQ kernel matches/beats
+OpenBLAS for these GEMM shapes (BiRefNet's Swin attention/MLP). DEPLOY IMPLICATION: do NOT add
+libopenblas to the deploy image — it only slows CPU. Throwaway image + build dir removed after.
+
+### Levers 3/4 (2x encoder, CONT/ADD) — inspected, no lossless redundancy to remove
+- Swin encoder runs twice on DIFFERENT inputs (full-res x AND downscale_by(x,2)); BiRefNet's
+  multi-scale design. No weight/activation sharing is possible without changing the output.
+  downscale_by is a cheap cont->interpolate->cont; nothing recomputed redundantly.
+- The 3 decoder `ggml_cont(x1/x2/x3)` before the lateral adds (birefnet.cpp) are CUDA binbcast
+  stride-assert guards. On CPU the add has no such assert, so they are pure CPU overhead — but
+  they are 3 of 333 CONT nodes (~7ms of the ~0.77s total CONT, <0.1% of wall). Not worth the
+  layout-fragility risk on the shared GPU correctness path. Skipped.
+
+### FINAL (this pass) — honest ceiling
+Best LOSSLESS CPU @1024/full-quality stays **~9.9 s, YAVG 180.974** — UNCHANGED. No safe
+full-quality CPU speedup found:
+  - ISA flags already -march=znver3 (AVX2+FMA+F16C) — floor (PROFILE.md / pass #1).
+  - Threads at the knee (6 = physical cores) — floor (pass #1).
+  - Quant (Q8_0/Q4_K) — off the table (quality) AND crashes at load (pass #1).
+  - F16 weights on CPU — crashes (this pass).
+  - OpenBLAS — measured slower (this pass).
+The model is MUL_MAT-bound (53%, Swin attention) on ggml's AVX2 MMQ kernel, which is already the
+fast path for these F32 GEMM shapes. The remaining real lever is the documented per-tensor-
+selective quant (quantize only 2D matmul weights, keep conv/deform F32) — but that is NOT
+lossless (it's quantization) so it is out of scope for this zero-quality-loss task.
+ggml UNTOUCHED (af69870c, both ~/dev/ggml and depend/ggml). src/visp/ml.cpp == committed HEAD.
