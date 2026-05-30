@@ -7,6 +7,8 @@
 
 #include <ggml.h>
 
+#include <cstdlib>
+
 namespace visp {
 namespace birefnet {
 
@@ -193,7 +195,9 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
 
     x3 = conv_2d(m["lateral_block4.conv"], x3);
     tensor _p4 = upscale_to(m, p4, x3);
-    tensor _p3 = ggml_add_inplace(m, _p4, x3);
+    // ggml-cuda's add kernel asserts element-aligned src1 strides (binbcast.cu);
+    // under whcn the lateral-conv output can be non-contiguous -> force cont.
+    tensor _p3 = ggml_add_inplace(m, _p4, ggml_cont(m, x3));
 
     {
         auto [w, h, c, n] = nelements_whcn(m, _p3);
@@ -210,7 +214,7 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
 
     _p3 = upscale_to(m, p3, x2);
     x2 = conv_2d(m["lateral_block3.conv"], x2);
-    tensor _p2 = ggml_add_inplace(m, _p3, x2);
+    tensor _p2 = ggml_add_inplace(m, _p3, ggml_cont(m, x2));
 
     {
         auto [w, h, c, n] = nelements_whcn(m, _p2);
@@ -227,7 +231,7 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
 
     _p2 = upscale_to(m, p2, x1);
     x1 = conv_2d(m["lateral_block2.conv"], x1);
-    tensor _p1 = ggml_add_inplace(m, _p2, x1);
+    tensor _p1 = ggml_add_inplace(m, _p2, ggml_cont(m, x1));
 
     {
         auto [w, h, c, n] = nelements_whcn(m, _p1);
@@ -313,6 +317,15 @@ birefnet_params birefnet_detect_params(
     birefnet_params p;
     p.image_size = f.get_int("birefnet.image_size");
     p.image_multiple = f.get_int("birefnet.image_multiple");
+    // VISP_BIREFNET_RES overrides the inference resolution. RMBG-2.0 is native
+    // 1024; CPU cost scales ~res^2, so lower values trade matte detail for speed.
+    // Ignored for dynamic models (image_size == -1, sized from the input).
+    if (char const* e = getenv("VISP_BIREFNET_RES"); e && p.image_size > 0) {
+        int r = atoi(e);
+        if (r >= 64) {
+            p.image_size = r;
+        }
+    }
     p.image_extent = birefnet_image_extent(dynamic_extent, p, max_alloc);
     p.encoder = swin_detect_params(f);
     return p;

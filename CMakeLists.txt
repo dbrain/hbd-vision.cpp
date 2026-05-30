@@ -12,6 +12,7 @@ option(VISP_INSTALL_MODELS "Download and install default models" ${VISP_PACKAGE}
 option(VISP_FMT_LIB "Use external fmt library instead of standard C++ <format>" OFF)
 option(VISP_STATIC_GGML "Force static build of ggml" OFF)
 option(VISP_ASAN "Enable AddressSanitizer" OFF)
+option(VISP_SERVER "Build the matting HTTP server" OFF)
 
 include(GNUInstallDirs)
 set(VISP_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header files")
@@ -136,13 +137,20 @@ if(VISP_CI)
     endforeach()
   endif()
 endif()
-add_subdirectory(depend/llama/ggml)
+# ggml backend: consolidated dbrain/ggml fork. It is a STANDALONE ggml repo
+# (CMake at its root), unlike Acly's in-llama ggml which lived at depend/llama/ggml.
+# Provided via the depend/ggml submodule (see .gitmodules).
+add_subdirectory(depend/ggml)
 set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
 
 # Vision.cpp libraries and executables
 
 add_subdirectory(src/visp)
 add_subdirectory(src/cli)
+
+if(VISP_SERVER)
+  add_subdirectory(src/server)
+endif()
 
 # Tests
 

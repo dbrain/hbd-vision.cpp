@@ -3,18 +3,33 @@
 
 namespace visp {
 
+// On the CUDA backend, loaded weights (bias/scale) live at the device "preferred
+// float type" (F16), while conv/linear activations compute in F32. ggml's CUDA
+// binary-broadcast ops (add/mul) assert matching element sizes and crash on a
+// mixed F32+F16 operand (binbcast.cu: nb10 % sizeof(src1_t) == 0). Cast the
+// weight operand up to the activation type before the op. The cast is lossless
+// (F16->F32) and is skipped entirely on the CPU path (where both operands are
+// already F32), so behaviour there is unchanged.
+//
+// NOTE: ggml_*_inplace cannot be used once the operand may need a cast, because
+// the cast produces a fresh tensor and the in-place result must alias `x` (the
+// activation), so we use the non-inplace ops here.
+static tensor cast_like(model_ref m, tensor w, tensor ref) {
+    return w->type == ref->type ? w : tensor(ggml_cast(m, w, ref->type));
+}
+
 tensor linear(model_ref m, tensor x) {
     x = ggml_mul_mat(m, m.weights("weight"), x);
     if (tensor bias = m.find("bias")) {
-        x = ggml_add_inplace(m, x, bias);
+        x = ggml_add(m, x, cast_like(m, bias, x));
     }
     return x;
 }
 
 tensor layer_norm(model_ref m, tensor x, float eps) {
     x = ggml_norm(m, x, eps);
-    x = ggml_mul_inplace(m, x, m.weights("weight"));
-    x = ggml_add_inplace(m, x, m.weights("bias"));
+    x = ggml_mul(m, x, cast_like(m, m.weights("weight"), x));
+    x = ggml_add(m, x, cast_like(m, m.weights("bias"), x));
     return named(m, x);
 }
 
@@ -64,7 +79,7 @@ tensor add_bias_2d(model_ref m, tensor x) {
         if (!(m.flags & model_build_flag::cwhn)) {
             bias = ggml_reshape_4d(m, bias, 1, 1, bias->ne[0], 1);
         }
-        x = ggml_add_inplace(m, x, bias);
+        x = ggml_add(m, x, cast_like(m, bias, x));
     }
     return x;
 }
@@ -93,7 +108,26 @@ tensor conv_2d(model_ref m, tensor x, int stride, int pad) {
             x = ggml_cont(m, permute_whcn_to_cwhn(m, x));
         }
     } else { // WHCN layout
-        x = ggml_conv_2d_direct(m, weight, x, stride, stride, pad, pad, 1, 1);
+        if (weight->ne[0] == 1 && weight->ne[1] == 1 && stride == 1 && pad == 0) {
+            // 1x1 conv == matmul over the channel dim. The whcn channel dim is
+            // dim2 (W,H,C,B), so bring C innermost, GEMM, then restore. The
+            // ggml_conv_2d_direct kernel is one-thread-per-output looping IC
+            // with no reuse; routing 1x1 through mul_mat uses cuBLAS/MMQ.
+            auto [w, h, c, b] = nelements(x);
+            tensor w2 = ggml_reshape_2d(m, weight, weight->ne[2], weight->ne[3]); // [IC, OC]
+            tensor xc = ggml_cont(m, permute_whcn_to_cwhn(m, x));                 // -> [C, W, H, B]
+            xc = ggml_reshape_2d(m, xc, c, w * h * b);                            // [C, W*H*B]
+            tensor y = ggml_mul_mat(m, w2, xc);                                   // [OC, W*H*B]
+            y = ggml_reshape_4d(m, y, weight->ne[3], w, h, b);                    // [OC, W, H, B]
+            x = ggml_cont(m, permute_cwhn_to_whcn(m, y));                         // -> [W, H, OC, B]
+        } else {
+            // k>1 conv. ggml_conv_2d_direct is one-thread-per-output looping
+            // IC*KH*KW with no reuse. ggml_conv_2d does im2col + ggml_mul_mat,
+            // which lands on cuBLAS/MMQ on CUDA. Same approach as the 1x1
+            // fast path above but with a real im2col GEMM. (BiRefNet-only call
+            // site; the shared CONV_2D kernel is untouched.)
+            x = ggml_conv_2d(m, weight, x, stride, stride, pad, pad, 1, 1);
+        }
     }
     x = add_bias_2d(m, x);
     return x;
@@ -135,6 +169,18 @@ tensor conv_transpose_2d(model_ref m, tensor x, int stride) {
 tensor conv_2d_deform(
     model_ref m, tensor x, tensor weight, tensor offset, tensor mask, int stride, int pad) {
 
+    // CONV_2D_DEFORM has no CUDA kernel, so on the GPU backend the scheduler
+    // offloads it to the CPU. The CPU deform kernel (ggml-cpu/ops.cpp) feeds the
+    // weight straight into ggml_call_mul_mat() with a hardcoded GGML_TYPE_F32 and
+    // has no F16 path. On the GPU path the model keeps its native F16 weights, so
+    // those F16 bytes would be reinterpreted as F32 -> garbage GEMM -> the ASPP
+    // decoder explodes to inf and the mask collapses. Cast the weight to F32 to
+    // match what the kernel expects. No-op on the CPU backend (weights already F32)
+    // and lossless (F16->F32). Mirrors conv_transpose_2d's f16 cast for its kernel.
+    if (weight->type != GGML_TYPE_F32) {
+        weight = ggml_cast(m, weight, GGML_TYPE_F32);
+    }
+
     if (m.flags & model_build_flag::cwhn) {
         x = permute_cwhn_to_whcn(m, x);
         weight = permute_cwhn_to_whcn(m, weight);
@@ -162,8 +208,8 @@ tensor batch_norm_2d(model_ref m, tensor x) {
         weight = ggml_reshape_4d(m, weight, 1, 1, weight->ne[0], 1);
         bias = ggml_reshape_4d(m, bias, 1, 1, bias->ne[0], 1);
     }
-    x = ggml_mul_inplace(m, x, weight);
-    x = ggml_add_inplace(m, x, bias);
+    x = ggml_mul(m, x, cast_like(m, weight, x));
+    x = ggml_add(m, x, cast_like(m, bias, x));
     return named(m, x);
 }
 

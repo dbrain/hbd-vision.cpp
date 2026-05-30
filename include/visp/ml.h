@@ -155,6 +155,11 @@ struct compute_graph {
     ggml_context_ptr context;
     ggml_cgraph* graph = nullptr;
     ggml_gallocr_ptr allocr;
+    // Multi-backend execution: when the compute device is a GPU, ops it cannot run
+    // (e.g. CONV_2D_DEFORM, which has no CUDA kernel) are routed to a CPU fallback
+    // backend via the scheduler. Both are null for the CPU-only path.
+    ggml_backend_ptr cpu_fallback;
+    ggml_backend_sched_ptr sched;
 
     operator ggml_cgraph*() const { return graph; }
 };

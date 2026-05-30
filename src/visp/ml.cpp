@@ -89,7 +89,18 @@ backend_device backend_init(backend_type type) {
     }
     b.device = ggml_backend_get_device(b.handle.get());
 
-    int nthreads = std::max(1, (int)std::thread::hardware_concurrency() - 2);
+    // Default CPU thread count. The BiRefNet matting workload is MUL_MAT/GEMM
+    // bound and memory-bandwidth limited, so it does not scale to all logical
+    // (SMT) threads; physical-core count is the knee on this class of CPU
+    // (verified on Zen3: 6 threads beats 8/10/12). Overridable via VISP_CPU_THREADS.
+    int hw = std::max(1, (int)std::thread::hardware_concurrency());
+    int nthreads = std::max(1, hw / 2); // physical cores (assume 2-way SMT)
+    if (char const* env = getenv("VISP_CPU_THREADS"); env && *env) {
+        int v = atoi(env);
+        if (v > 0) {
+            nthreads = v;
+        }
+    }
     backend_set_n_threads(b, nthreads);
     return b;
 }
@@ -114,6 +125,14 @@ typedef bool (*ggml_backend_dev_supports_f16_t)(ggml_backend_dev_t);
 
 ggml_type backend_device::preferred_float_type() const {
     if (type() & backend_type::cpu) {
+        // CPU keeps weights F32. NOTE: a blanket weight quantization here
+        // (returning GGML_TYPE_Q8_0/Q4_K so the decoder linears use ggml's AVX2
+        // quantized dot-product) was evaluated and does NOT work: it also tries
+        // to cast the conv2d / deformable-conv weights, and ggml's CPU cast to a
+        // k-quant/Q8_0 of those shapes hits an unimplemented path (ggml-cpu
+        // ops.cpp "not implemented") and aborts at model load. A real quant lever
+        // would need per-tensor selectivity (quantize only the 2D matmul weights,
+        // keep conv/deform F32) — a larger change, left for a follow-up.
         return GGML_TYPE_F32; // not all operations support F16
     } else {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
