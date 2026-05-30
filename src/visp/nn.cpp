@@ -1,7 +1,40 @@
 #include "nn.h"
 #include "util/string.h"
+#include <cstdlib>
 
 namespace visp {
+
+// VRAM lever: a k>1 conv routed through ggml_conv_2d materialises an im2col matrix of
+// [IC*KH*KW, OH*OW] F32 elements. For the encoder's full-resolution high-channel convs
+// this single buffer is up to ~1.15 GiB and dominates GPU peak VRAM. ggml_conv_2d_direct
+// streams the conv with no im2col buffer (slower per-conv, tiny VRAM). This returns the
+// im2col element count so the call site can pick direct vs im2col by a tunable threshold.
+// Threshold via env VISP_IM2COL_MAX (in MiB of the F32 im2col matrix); 0/unset = always
+// im2col (legacy behaviour). Latency is not a concern for the matting deploy, VRAM is.
+static int64_t im2col_max_elems() {
+    static int64_t cached = -1;
+    if (cached < 0) {
+        // Default 128 MiB caps GPU peak VRAM at ~2524 MiB (vs ~3596 unbounded) at full
+        // 1024 quality and ~free latency (~712 vs ~691 ms). The matting deploy is a
+        // worker-isolated lazy-evict GPU service that must fit the free-VRAM window when
+        // the heavy GPU services are resident, so low peak is the priority. Set
+        // VISP_IM2COL_MAX=0 to disable (always im2col, lowest latency, highest VRAM),
+        // or a smaller MiB value to push more convs to the streaming direct kernel.
+        char const* e = getenv("VISP_IM2COL_MAX"); // MiB
+        double mib = e ? atof(e) : 128.0;
+        cached = mib > 0 ? (int64_t)(mib * 1024.0 * 1024.0 / 4.0) : 0; // F32 elems
+    }
+    return cached;
+}
+
+// im2col matrix element count for a conv: IC*KH*KW (per output px) * OH*OW (output px).
+static int64_t im2col_elems(int64_t ic, int64_t kh, int64_t kw, int64_t oh, int64_t ow) {
+    return ic * kh * kw * oh * ow;
+}
+
+static int64_t conv_out_dim(int64_t in, int64_t k, int stride, int pad) {
+    return (in + 2 * pad - k) / stride + 1;
+}
 
 // On the CUDA backend, loaded weights (bias/scale) live at the device "preferred
 // float type" (F16), while conv/linear activations compute in F32. ggml's CUDA
@@ -102,9 +135,22 @@ tensor conv_2d(model_ref m, tensor x, int stride, int pad) {
             x = permute_whcn_to_cwhn(m, x);
 
         } else {
+            // cwhn k>1 conv. weight is cwhn [IC, KW, KH, OC]; x is cwhn [C, W, H, B].
+            // This is the ENCODER path (patch_embed sets cwhn) and holds the biggest
+            // im2col buffers (full-res high-channel convs, up to ~1.15 GiB). When the
+            // im2col matrix would exceed VISP_IM2COL_MAX, use the direct kernel (no
+            // im2col buffer) to cap peak VRAM at a small latency cost.
+            int64_t ic = weight->ne[0], kw = weight->ne[1], kh = weight->ne[2];
+            int64_t oh = conv_out_dim(x->ne[2], kh, stride, pad);
+            int64_t ow = conv_out_dim(x->ne[1], kw, stride, pad);
+            int64_t mx = im2col_max_elems();
             weight = ggml_cont(m, permute_cwhn_to_whcn(m, weight));
             x = ggml_cont(m, permute_cwhn_to_whcn(m, x));
-            x = ggml_conv_2d(m, weight, x, stride, stride, pad, pad, 1, 1);
+            if (mx > 0 && im2col_elems(ic, kh, kw, oh, ow) > mx) {
+                x = ggml_conv_2d_direct(m, weight, x, stride, stride, pad, pad, 1, 1);
+            } else {
+                x = ggml_conv_2d(m, weight, x, stride, stride, pad, pad, 1, 1);
+            }
             x = ggml_cont(m, permute_whcn_to_cwhn(m, x));
         }
     } else { // WHCN layout
@@ -121,12 +167,20 @@ tensor conv_2d(model_ref m, tensor x, int stride, int pad) {
             y = ggml_reshape_4d(m, y, weight->ne[3], w, h, b);                    // [OC, W, H, B]
             x = ggml_cont(m, permute_cwhn_to_whcn(m, y));                         // -> [W, H, OC, B]
         } else {
-            // k>1 conv. ggml_conv_2d_direct is one-thread-per-output looping
-            // IC*KH*KW with no reuse. ggml_conv_2d does im2col + ggml_mul_mat,
-            // which lands on cuBLAS/MMQ on CUDA. Same approach as the 1x1
-            // fast path above but with a real im2col GEMM. (BiRefNet-only call
-            // site; the shared CONV_2D kernel is untouched.)
-            x = ggml_conv_2d(m, weight, x, stride, stride, pad, pad, 1, 1);
+            // k>1 conv (whcn = decoder). ggml_conv_2d does im2col + ggml_mul_mat
+            // (cuBLAS/MMQ on CUDA). When the im2col matrix would exceed
+            // VISP_IM2COL_MAX, fall back to the streaming direct kernel to cap
+            // peak VRAM. (BiRefNet-only call site; shared CONV_2D kernel untouched.)
+            // weight is whcn [KW, KH, IC, OC]; x is whcn [W, H, C, B].
+            int64_t kw = weight->ne[0], kh = weight->ne[1], ic = weight->ne[2];
+            int64_t ow = conv_out_dim(x->ne[0], kw, stride, pad);
+            int64_t oh = conv_out_dim(x->ne[1], kh, stride, pad);
+            int64_t mx = im2col_max_elems();
+            if (mx > 0 && im2col_elems(ic, kh, kw, oh, ow) > mx) {
+                x = ggml_conv_2d_direct(m, weight, x, stride, stride, pad, pad, 1, 1);
+            } else {
+                x = ggml_conv_2d(m, weight, x, stride, stride, pad, pad, 1, 1);
+            }
         }
     }
     x = add_bias_2d(m, x);
