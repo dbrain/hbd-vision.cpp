@@ -318,3 +318,34 @@ fast path for these F32 GEMM shapes. The remaining real lever is the documented 
 selective quant (quantize only 2D matmul weights, keep conv/deform F32) — but that is NOT
 lossless (it's quantization) so it is out of scope for this zero-quality-loss task.
 ggml UNTOUCHED (af69870c, both ~/dev/ggml and depend/ggml). src/visp/ml.cpp == committed HEAD.
+
+## ═══ DEFINITIVE BASELINE: real briaai/RMBG-2.0 PyTorch vs our C++ port ═══
+(2026-05-30, real gated RMBG-2.0 via HF token, RTX 3060 + 5600X, warm, fp16, self-verified matte)
+
+| Metric | RMBG-2.0 PyTorch fp16 | Our C++/ggml port | Winner |
+|--------|----------------------|-------------------|--------|
+| GPU @1024 | **247.7 ms** | 695 ms | PyTorch 2.8× |
+| GPU @512  | 76.3 ms | (not yet on our binary) | — |
+| GPU resident VRAM (nvidia-smi idle) | 1022 MiB | **524 MiB** | ours (2×) |
+| GPU peak VRAM (nvidia-smi, @1024) | **2840 MiB** | 3580 MiB | PyTorch |
+| CPU @1024 (6 thr) | 13.6 s | **9.9 s** | ours 1.4× |
+| CPU @512 | 3.1 s | (~2.5s ours, prior) | ~tie |
+| Matte YAVG @1024 | 181.13 | 181.09 (MAD 1.43/255) | identical |
+
+PyTorch VRAM detail (fp16): resident weights torch_alloc 443 MiB; peak torch_alloc
+1631 MiB @1024 / 755 @512 (~2.1× with res); nvidia-smi peak 2840 @1024 / 1340 @512.
+The ~580 MiB gap (torch 443 resident vs nvidia-smi 1022 idle) = CUDA/cuDNN context.
+
+PARITY CONFIRMED: real RMBG-2.0 matte (181.13) == our C++ port (181.09), MAD 1.43/255,
+visually identical → the port faithfully reproduces the genuine shipped model.
+
+### What this means
+- GPU: PyTorch is 2.8× faster (cuDNN deformable+regular convs >> our hand kernels). Our
+  PROFILE.md already located why: deform 46% + CONV_2D 39%. ~440ms GPU headroom exists.
+- Our port's real wins: 2× leaner RESIDENT VRAM (524 vs 1022 — matters for fit-alongside),
+  1.4× faster CPU, single static binary, no python/torch stack, resident-warm server.
+- Our port's loss: higher PEAK VRAM (3580 vs 2840) — the im2col-GEMM scratch (the speed/VRAM
+  trade). Both the GPU-speed gap and the peak-VRAM are addressable (better deform/conv kernels
+  + scratch capping), but PyTorch fp16 254ms is the bar.
+env note: agent forced to Python 3.14 + torch 2.12.0+cu130 (no 3.14 wheels for 2.6/cu124);
+numbers still valid (warm cuDNN). 13GB venv/cache cleaned. Matte: bench/rmbg2_pytorch_matte_1024.png.
