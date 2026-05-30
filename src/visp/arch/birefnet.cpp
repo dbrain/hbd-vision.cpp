@@ -243,9 +243,46 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
     _p1 = basic_decoder_block(m["block1"], _p1);
     _p1 = upscale_to(m, _p1, x);
     tensor p1_ipt = simple_conv(m["ipt_blk1"], x);
-    _p1 = ggml_concat(m, _p1, p1_ipt, channel_dim);
 
-    tensor p1_out = conv_2d(m["conv_out1.0"], _p1);
+    // Output head. conv_out1.0 is a 1x1 conv (240->1 for RMBG-2.0), so
+    //   conv1x1(concat([_p1, p1_ipt]))  ==  conv1x1_a(_p1) + conv1x1_b(p1_ipt)
+    // where the weight is split along input channels. Doing the split avoids
+    // materialising the full-resolution concat ([1024,1024,240] = 960 MiB) — the
+    // single largest transient buffer in the graph (bench/VRAM.md) — at the cost of
+    // one extra small add. VRAM is the deploy priority (worker-isolated GPU service
+    // sharing the card), so this is a pure peak-VRAM win, lossless modulo FP add
+    // order. Only the whcn (GPU) path needs it; the cwhn (CPU) path keeps the plain
+    // concat (CPU has no VRAM pressure and a different 1x1 layout).
+    model_ref m_out = m["conv_out1.0"];
+    tensor cw = m_out.weights("weight");
+    tensor p1_out;
+    if (is_whcn(m) && cw->ne[0] == 1 && cw->ne[1] == 1 &&
+        cw->ne[2] == _p1->ne[2] + p1_ipt->ne[2]) {
+        int64_t oc = cw->ne[3];
+        tensor w2 = ggml_reshape_2d(m, cw, cw->ne[2], oc); // [IC, OC]
+        int64_t c1 = _p1->ne[2], c2 = p1_ipt->ne[2];
+        tensor wa = ggml_cont(m, ggml_view_2d(m, w2, c1, oc, w2->nb[1], 0));
+        tensor wb = ggml_cont(m, ggml_view_2d(m, w2, c2, oc, w2->nb[1], c1 * w2->nb[0]));
+        auto conv1x1 = [&](tensor x_in, tensor wt) {
+            auto [w, h, c, b] = nelements(x_in);
+            tensor xc = ggml_cont(m, permute_whcn_to_cwhn(m, x_in)); // [C, W, H, B]
+            xc = ggml_reshape_2d(m, xc, c, w * h * b);               // [C, W*H*B]
+            tensor y = ggml_mul_mat(m, wt, xc);                      // [OC, W*H*B]
+            y = ggml_reshape_4d(m, y, oc, w, h, b);                  // [OC, W, H, B]
+            return ggml_cont(m, permute_cwhn_to_whcn(m, y));         // [W, H, OC, B]
+        };
+        p1_out = ggml_add(m, conv1x1(_p1, wa), conv1x1(p1_ipt, wb));
+        if (tensor bias = m_out.find("bias")) {
+            bias = ggml_reshape_4d(m, bias, 1, 1, oc, 1);
+            if (bias->type != p1_out->type) {
+                bias = ggml_cast(m, bias, p1_out->type);
+            }
+            p1_out = ggml_add(m, p1_out, bias);
+        }
+    } else {
+        _p1 = ggml_concat(m, _p1, p1_ipt, channel_dim);
+        p1_out = conv_2d(m["conv_out1.0"], _p1);
+    }
     p1_out = ggml_sigmoid_inplace(m, p1_out);
 
     return named(m, p1_out);
