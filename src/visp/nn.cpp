@@ -321,6 +321,20 @@ tensor attention(
     if (m.flags & model_build_flag::flash_attention) {
         v = ggml_permute(m, v, 0, 2, 1, 3);
 
+        // The CUDA flash-attn kernel has no head_dim=32 instance (Swin; crashes fattn.cu).
+        // Zero-pad head_dim to 64: lossless (padded K dims are 0 -> no effect on Q.Kᵀ, so
+        // `scale`=1/sqrt(orig_hd) is unchanged; padded V dims are 0 -> output tail is 0 and
+        // sliced off). Combined with per-head-mask support in fattn (dbrain/ggml), this lets
+        // the Swin encoder use FA, which avoids materialising the [n,n] per-window scores.
+        int64_t head_dim = q->ne[0];
+        bool pad_head = head_dim < 64;
+        if (pad_head) {
+            int64_t pd = 64 - head_dim;
+            q = ggml_pad(m, ggml_cont(m, q), pd, 0, 0, 0);
+            k = ggml_pad(m, ggml_cont(m, k), pd, 0, 0, 0);
+            v = ggml_pad(m, ggml_cont(m, v), pd, 0, 0, 0);
+        }
+
         k = ggml_cast(m, k, GGML_TYPE_F16);
         v = ggml_cast(m, v, GGML_TYPE_F16);
         if (mask && mask->type != GGML_TYPE_F16) {
@@ -329,6 +343,11 @@ tensor attention(
 
         x = ggml_flash_attn_ext(m, q, k, v, mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(x, GGML_PREC_F32);
+
+        if (pad_head) { // slice padded head_dim back to the real size
+            x = ggml_cont(m, ggml_view_4d(m, x, head_dim, x->ne[1], x->ne[2], x->ne[3],
+                                          x->nb[1], x->nb[2], x->nb[3], 0));
+        }
 
     } else {
         v = ggml_cont(m, ggml_permute(m, v, 1, 2, 0, 3));
