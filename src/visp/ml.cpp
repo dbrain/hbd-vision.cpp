@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -565,7 +567,83 @@ bool compute_graph_allocate(compute_graph& g, backend_device const& backend) {
     return result;
 }
 
+namespace {
+
+// Per-op profiler (re-added; the previous VISP_PROFILE_OPS profiler was lost in a
+// git-checkout incident). Gated by env VISP_PROFILE_OPS: when set, dump a CSV of
+// every graph node with its op name, src0/src1/dst ne-dims and per-node wall time
+// (us). If the env value looks like a path it is used as the output file, else the
+// default bench/visp_profile.csv. Zero cost when unset.
+//
+// Timing: a temporary single-backend ggml_backend_sched is built over the one
+// compute backend and an eval-callback is installed. The backend is synchronized
+// before the first node and after every node, so each op is timed in isolation
+// (per-node sync inflates absolute wall slightly, but op dims + relative shares —
+// which the roofline uses — are exact).
+struct op_profiler {
+    FILE* out = nullptr;
+    std::chrono::steady_clock::time_point last;
+    ggml_backend_t backend = nullptr;
+    int idx = 0;
+
+    op_profiler(char const* env, ggml_backend_t b) : backend(b) {
+        char const* path =
+            (env && (strchr(env, '/') || strstr(env, ".csv"))) ? env : "bench/visp_profile.csv";
+        out = fopen(path, "w");
+        if (out) {
+            fprintf(
+                out, "op,idx,ne00,ne01,ne02,ne03,ne10,ne11,ne12,ne13,dst0,dst1,dst2,dst3,us\n");
+        }
+    }
+    ~op_profiler() {
+        if (out) {
+            fclose(out);
+        }
+    }
+
+    static bool callback(ggml_tensor* t, bool ask, void* ud) {
+        auto* self = static_cast<op_profiler*>(ud);
+        if (ask) {
+            return true; // observe every node
+        }
+        ggml_backend_synchronize(self->backend);
+        auto now = std::chrono::steady_clock::now();
+        int64_t us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - self->last).count();
+        self->last = now;
+        if (self->out) {
+            ggml_tensor* s0 = t->src[0];
+            ggml_tensor* s1 = t->src[1];
+            auto d = [](ggml_tensor* x, int i) { return x ? (long long)x->ne[i] : 0LL; };
+            fprintf(
+                self->out,
+                "%s,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n",
+                ggml_op_name(t->op), self->idx, d(s0, 0), d(s0, 1), d(s0, 2), d(s0, 3), d(s1, 0),
+                d(s1, 1), d(s1, 2), d(s1, 3), (long long)t->ne[0], (long long)t->ne[1],
+                (long long)t->ne[2], (long long)t->ne[3], (long long)us);
+        }
+        ++self->idx;
+        return true;
+    }
+};
+
+} // namespace
+
 void compute(compute_graph const& g, backend_device const& b) {
+    if (char const* env = getenv("VISP_PROFILE_OPS"); env && *env) {
+        ggml_backend_t backend = b.handle.get();
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        ggml_backend_sched_ptr sched(
+            ggml_backend_sched_new(&backend, &buft, 1, ggml_graph_size(g.graph), false, false));
+        op_profiler prof(env, backend);
+        ggml_backend_sched_set_eval_callback(sched.get(), &op_profiler::callback, &prof);
+        ggml_backend_sched_reserve(sched.get(), g.graph);
+        ggml_backend_synchronize(backend);
+        prof.last = std::chrono::steady_clock::now();
+        ggml_backend_sched_graph_compute(sched.get(), g.graph);
+        ggml_backend_synchronize(backend);
+        return;
+    }
     ggml_backend_graph_compute(b, g.graph);
 }
 
