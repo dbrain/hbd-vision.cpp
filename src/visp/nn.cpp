@@ -14,14 +14,18 @@ namespace visp {
 static int64_t im2col_max_elems() {
     static int64_t cached = -1;
     if (cached < 0) {
-        // Default 128 MiB caps GPU peak VRAM at ~2524 MiB (vs ~3596 unbounded) at full
-        // 1024 quality and ~free latency (~712 vs ~691 ms). The matting deploy is a
-        // worker-isolated lazy-evict GPU service that must fit the free-VRAM window when
-        // the heavy GPU services are resident, so low peak is the priority. Set
-        // VISP_IM2COL_MAX=0 to disable (always im2col, lowest latency, highest VRAM),
-        // or a smaller MiB value to push more convs to the streaming direct kernel.
+        // Threshold (MiB of the F32 im2col matrix) above which a conv uses the streaming
+        // ggml_conv_2d_direct kernel (no im2col buffer) instead of im2col+cuBLAS. The
+        // direct kernel is much slower but VRAM-free; im2col+cuBLAS is fast but needs the
+        // buffer. MEASURED on the post-fusion graph (cat-and-hat @1024, GPU):
+        //   VISP_IM2COL_MAX=128  -> peak 1440 MiB, ~1271 ms  (min VRAM)
+        //   VISP_IM2COL_MAX=2048 -> peak 1540 MiB, ~ 827 ms  (DEFAULT: -35% for +100 MiB)
+        //   VISP_IM2COL_MAX=0    -> always im2col, peak 2436 MiB, ~667 ms (fastest)
+        // CONV_2D was 54% of runtime on the direct kernel; 2048 routes the big decoder
+        // convs to im2col+cuBLAS for a large speedup at a tiny (+100 MiB) VRAM cost. Set
+        // VISP_IM2COL_MAX=128 for min-VRAM, or 0 for max speed.
         char const* e = getenv("VISP_IM2COL_MAX"); // MiB
-        double mib = e ? atof(e) : 128.0;
+        double mib = e ? atof(e) : 2048.0;
         cached = mib > 0 ? (int64_t)(mib * 1024.0 * 1024.0 / 4.0) : 0; // F32 elems
     }
     return cached;
