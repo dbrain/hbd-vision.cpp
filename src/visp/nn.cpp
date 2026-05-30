@@ -18,14 +18,15 @@ static int64_t im2col_max_elems() {
         // ggml_conv_2d_direct kernel (no im2col buffer) instead of im2col+cuBLAS. The
         // direct kernel is much slower but VRAM-free; im2col+cuBLAS is fast but needs the
         // buffer. MEASURED on the post-fusion graph (cat-and-hat @1024, GPU):
-        //   VISP_IM2COL_MAX=128  -> peak 1440 MiB, ~1271 ms  (min VRAM)
-        //   VISP_IM2COL_MAX=2048 -> peak 1540 MiB, ~ 827 ms  (DEFAULT: -35% for +100 MiB)
-        //   VISP_IM2COL_MAX=0    -> always im2col, peak 2436 MiB, ~667 ms (fastest)
-        // CONV_2D was 54% of runtime on the direct kernel; 2048 routes the big decoder
-        // convs to im2col+cuBLAS for a large speedup at a tiny (+100 MiB) VRAM cost. Set
-        // VISP_IM2COL_MAX=128 for min-VRAM, or 0 for max speed.
+        // Measured warm (matting server, +F16 encoder), peak VRAM / warm-ms:
+        //   VISP_IM2COL_MAX=128  -> 1276 MiB / 1146 ms  (DEFAULT: min VRAM, co-resident-safe)
+        //   VISP_IM2COL_MAX=2048 -> 1450 MiB /  698 ms  (-448 ms for +174 MiB — the snappy pick)
+        //   VISP_IM2COL_MAX=0    -> 2436 MiB /  ~667 ms  (always im2col, fastest)
+        // CONV_2D dominates runtime on the direct kernel; raising this routes the big decoder
+        // convs to im2col+cuBLAS (faster, more VRAM). Default 128 favours VRAM (the matting
+        // service shares the card); set VISP_IM2COL_MAX=2048 for the big speedup at +174 MiB.
         char const* e = getenv("VISP_IM2COL_MAX"); // MiB
-        double mib = e ? atof(e) : 2048.0;
+        double mib = e ? atof(e) : 128.0;
         cached = mib > 0 ? (int64_t)(mib * 1024.0 * 1024.0 / 4.0) : 0; // F32 elems
     }
     return cached;

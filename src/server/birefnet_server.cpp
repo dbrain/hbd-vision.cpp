@@ -308,10 +308,15 @@ static int run_worker(const ServerConfig& cfg) {
     int fd = cfg.worker_fd;
     backend_type bt = cfg.default_backend;
 
-    // BiRefNet's Swin attention has head_dim=32, which crashes the CUDA flash-attn
-    // kernel (fattn.cu). Default FA off (still overridable via the env var) so the
-    // worker matches the verified-correct CLI config. Must be set before backend init.
+    // BiRefNet's Swin attention has head_dim=32 — flash-attn now works (per-head mask +
+    // head_dim pad) but is slower than F16-encoder here, so default FA OFF.
     ::setenv("VISP_FLASH_ATTENTION", "0", 0);
+    // Default the matting service to F16 encoder activations: near-lossless (YAVG ~181.1)
+    // and lower peak VRAM (1440->1276 MiB @ IM2COL=128) — the deploy priority is fitting
+    // the shared 12GB card. All overridable from the container env (overwrite=0):
+    //   VISP_F16_ENCODER=0  -> bit-exact-ish F32 path
+    //   VISP_IM2COL_MAX=2048 -> ~448 ms faster for +174 MiB (1450 MiB / ~698 ms warm)
+    ::setenv("VISP_F16_ENCODER", "1", 0);
 
     std::unique_ptr<backend_device> backend;
     std::unique_ptr<birefnet_model> model;
