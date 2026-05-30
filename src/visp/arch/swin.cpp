@@ -249,6 +249,18 @@ swin_result encode(model_ref m, tensor x, swin_params const& p) {
     auto [c, w, h, b] = nelements(x);
     x = ggml_reshape_3d(m, x, c, w * h, b);
 
+    // Opt-in F16 activations through the transformer blocks. The Swin encoder is the GPU
+    // peak-VRAM floor (bench/VRAM.md); running its activations in F16 halves the big
+    // [768,n] MLP + [n,n] attention buffers. Enabled by VISP_F16_ENCODER. The patch_embed
+    // conv ran F32 above; cast into F16 here, run the blocks F16 (mul_mat F16 dst +
+    // F16 norm/softmax/scale/gelu/add), then cast each output feature back to F32 (the
+    // decoder + encode_concat's upscale are F32-only). Near-lossless (F16 store; F32 accum).
+    const bool f16 = getenv("VISP_F16_ENCODER") != nullptr;
+    if (f16) {
+        m.flags |= model_build_flag::f16_activations;
+        x = ggml_cast(m, x, GGML_TYPE_F16);
+    }
+
     layer_result r{x, w, h, x, w, h};
     swin_result outs = {};
 
@@ -260,6 +272,9 @@ swin_result encode(model_ref m, tensor x, swin_params const& p) {
         tensor_name norm_layer = format<tensor_name>("norm{}", i);
         tensor out = layer_norm(m[norm_layer], r.x_out);
         out = ggml_reshape_4d(m, out, p.layers[i].n_features, r.w_out, r.h_out, b);
+        if (f16) {
+            out = ggml_cast(m, out, GGML_TYPE_F32); // decoder consumes F32
+        }
         outs[i] = out;
     }
     return outs;

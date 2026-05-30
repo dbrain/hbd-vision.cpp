@@ -73,7 +73,8 @@ enum class model_build_flag {
     concat_n            = 1 << 2,
     f16_conv_transpose  = 1 << 3,
     window_partition    = 1 << 4,
-    flash_attention     = 1 << 5
+    flash_attention     = 1 << 5,
+    f16_activations     = 1 << 6  // run activations in F16 (mul_mat F16 dst + F16 norm/softmax/scale)
 }; // clang-format on
 
 using model_build_flags = flags<model_build_flag>;

@@ -52,7 +52,14 @@ static tensor cast_like(model_ref m, tensor w, tensor ref) {
 }
 
 tensor linear(model_ref m, tensor x) {
-    x = ggml_mul_mat(m, m.weights("weight"), x);
+    // When f16_activations is set (transformer encoder), emit an F16 dst directly
+    // (ggml_mul_mat_ext, cuBLAS gemmEx F16-out / F32-accumulate) so activations stay F16
+    // across the matmul with no cast churn. Default path is unchanged (F32 dst).
+    if (m.flags & model_build_flag::f16_activations) {
+        x = ggml_mul_mat_ext(m, m.weights("weight"), x, GGML_TYPE_F16);
+    } else {
+        x = ggml_mul_mat(m, m.weights("weight"), x);
+    }
     if (tensor bias = m.find("bias")) {
         x = ggml_add(m, x, cast_like(m, bias, x));
     }
@@ -340,6 +347,11 @@ tensor attention(
         if (mask && mask->type != GGML_TYPE_F16) {
             mask = ggml_cast(m, mask, GGML_TYPE_F16);
         }
+        // FA requires Q in F32 (it takes K/V as F16). Under f16_activations Q is F16 — cast
+        // it back (cheap: Q is small and the [n,n] scores are never materialised by FA).
+        if (q->type != GGML_TYPE_F32) {
+            q = ggml_cast(m, q, GGML_TYPE_F32);
+        }
 
         x = ggml_flash_attn_ext(m, q, k, v, mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(x, GGML_PREC_F32);
@@ -352,9 +364,12 @@ tensor attention(
     } else {
         v = ggml_cont(m, ggml_permute(m, v, 1, 2, 0, 3));
 
-        tensor attn = ggml_mul_mat(m, k, q);
+        bool f16 = !!(m.flags & model_build_flag::f16_activations);
+        // F16 scores keep the [n,n] attention matrix at half size (115 vs 230 MiB/window
+        // set), and softmax now runs F16 too. Accumulation stays F32 (gemmEx COMPUTE_32F).
+        tensor attn = f16 ? tensor(ggml_mul_mat_ext(m, k, q, GGML_TYPE_F16)) : ggml_mul_mat(m, k, q);
         attn = ggml_soft_max_ext(m, attn, mask, scale, 0.0f);
-        x = ggml_mul_mat(m, v, attn);
+        x = f16 ? tensor(ggml_mul_mat_ext(m, v, attn, GGML_TYPE_F16)) : ggml_mul_mat(m, v, attn);
 
         x = ggml_cont(m, ggml_permute(m, x, 0, 2, 1, 3));
     }
