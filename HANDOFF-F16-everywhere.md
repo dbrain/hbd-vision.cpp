@@ -55,7 +55,26 @@
 #     + ~7ms (decode+post-proc+PNG+HTTP combined). There is NO fat overhead to trim — it's
 #     ~98% GPU graph compute. Big perf wins require better conv/deform kernels (the cuDNN gap,
 #     PROFILE.md: deform 46% + conv 39%) = multi-week, exceeds a medium-effort cap.
-#   SUB-1GB PATHS (both deliberate, NOT done): (A) F16 custom conv kernels -> ~1000 ceiling,
+#   PEAK ANATOMY (graph-truncation probes, MEASURED 2026-05-31 — the decisive map):
+#     full-res Swin pass only ......... 1290 MiB   <- THE FLOOR (encoder stage-1 attention)
+#     + half-res pass + encode_concat . 1296 MiB   (+6)
+#     + squeeze block ................. 1432 MiB   (+136  <- 2nd target, basic_decoder_block)
+#     + all 4 decoder blocks + head ... 1440 MiB   (+8    decoder is NOT the peak)
+#     => The binding peak is the Swin ENCODER (1290 floor), not the decoder. Tiling the
+#        decoder (the original plan B) is FUTILE. Sub-1GB is gated by the Swin encoder.
+#   FA-FOR-SWIN is BLOCKED by more than head_dim: fattn.cu:488 returns NONE when mask->ne[2]
+#     != 1, and Swin's mask is PER-HEAD ([n,n,n_heads,b]) because the relative-position bias
+#     is per-head. head_dim=32 padding to 64 works (lossless, tried) but the per-head mask
+#     still disqualifies every FA kernel. => enabling FA needs PER-HEAD additive-mask support
+#     added to fattn.cu (load/index mask by head) — a real shared-ggml CUDA change, but a
+#     FLEET lever (any per-head-bias attention benefits) and it removes the encoder's [n,n]
+#     scores buffers (the 1290 floor) AND speeds the encoder. THIS is the sub-1GB lever.
+#   SUB-1GB PATHS (all deliberate, multi-day, NOT done; pick in this order):
+#     (0) Swin-encoder FA via per-head-mask fattn.cu + head_dim<64 zero-pad (NEW, best:
+#         attacks the 1290 floor, fleet-wide VRAM+perf, additive to ggml). Est: removes the
+#         per-window [144,144] scores -> encoder floor could drop a few hundred MiB.
+#     (B') squeeze-block +136 trim (cheaper, but floor stays 1290 -> not sub-1GB alone).
+#  (A) F16 custom conv kernels -> ~1000 ceiling,
 #     multi-week, shared-fleet regression risk; (B) decoder spatial tiling -> lossless,
 #     birefnet-local, multi-hour, could go lower but real restructure with halo handling.
 #
