@@ -241,18 +241,25 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
         _p1 = ggml_concat(m, _p1, patches, channel_dim);
     }
     _p1 = basic_decoder_block(m["block1"], _p1);
-    _p1 = upscale_to(m, _p1, x);
+    // NB: _p1 is NOT upscaled here — the output head below fuses the upscale into a
+    // low-res 1x1 conv (see the commute argument). The plain-concat fallback upscales.
     tensor p1_ipt = simple_conv(m["ipt_blk1"], x);
 
-    // Output head. conv_out1.0 is a 1x1 conv (240->1 for RMBG-2.0), so
-    //   conv1x1(concat([_p1, p1_ipt]))  ==  conv1x1_a(_p1) + conv1x1_b(p1_ipt)
-    // where the weight is split along input channels. Doing the split avoids
-    // materialising the full-resolution concat ([1024,1024,240] = 960 MiB) — the
-    // single largest transient buffer in the graph (bench/VRAM.md) — at the cost of
-    // one extra small add. VRAM is the deploy priority (worker-isolated GPU service
-    // sharing the card), so this is a pure peak-VRAM win, lossless modulo FP add
-    // order. Only the whcn (GPU) path needs it; the cwhn (CPU) path keeps the plain
-    // concat (CPU has no VRAM pressure and a different 1x1 layout).
+    // Output head, VRAM-fused. conv_out1.0 is a 1x1 conv (240->1 for RMBG-2.0). Two
+    // lossless algebraic identities collapse the most expensive full-res buffers:
+    //   (1) 1x1-conv over a channel-concat == sum of two 1x1 convs on the split halves
+    //         conv1x1(concat([A, B])) == conv1x1_a(A) + conv1x1_b(B)
+    //       -> never materialise the [1024,1024,240] concat (960 MiB).
+    //   (2) a 1x1 conv (channel-linear) commutes with bilinear upscale (spatial-linear),
+    //       since they act on orthogonal axes:
+    //         conv1x1_a(upscale(_p1)) == upscale(conv1x1_a(_p1))
+    //       -> run conv1x1_a at the low (pre-upscale) resolution and upscale only its
+    //          single output channel, never materialising the [1024,1024,192] upscale
+    //          (768 MiB). _p1 stays at decoder res (~256^2).
+    // Together these remove the graph's two largest transient buffers at full 1024
+    // quality. VRAM is the deploy priority (worker-isolated service sharing the 12GB
+    // card). Lossless modulo FP add/interp order. whcn/GPU path only; cwhn/CPU keeps the
+    // plain concat (no VRAM pressure, different 1x1 layout).
     model_ref m_out = m["conv_out1.0"];
     tensor cw = m_out.weights("weight");
     tensor p1_out;
@@ -271,7 +278,9 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
             y = ggml_reshape_4d(m, y, oc, w, h, b);                  // [OC, W, H, B]
             return ggml_cont(m, permute_cwhn_to_whcn(m, y));         // [W, H, OC, B]
         };
-        p1_out = ggml_add(m, conv1x1(_p1, wa), conv1x1(p1_ipt, wb));
+        tensor y_a = upscale_to(m, conv1x1(_p1, wa), x); // conv at low res, upscale 1ch
+        tensor y_b = conv1x1(p1_ipt, wb);                // p1_ipt already full-res
+        p1_out = ggml_add(m, y_a, y_b);
         if (tensor bias = m_out.find("bias")) {
             bias = ggml_reshape_4d(m, bias, 1, 1, oc, 1);
             if (bias->type != p1_out->type) {
@@ -280,6 +289,7 @@ tensor decode(model_ref m, tensor x, swin_result const& features) {
             p1_out = ggml_add(m, p1_out, bias);
         }
     } else {
+        _p1 = upscale_to(m, _p1, x);
         _p1 = ggml_concat(m, _p1, p1_ipt, channel_dim);
         p1_out = conv_2d(m["conv_out1.0"], _p1);
     }
