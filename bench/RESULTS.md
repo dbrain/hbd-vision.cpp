@@ -349,3 +349,25 @@ visually identical → the port faithfully reproduces the genuine shipped model.
   + scratch capping), but PyTorch fp16 254ms is the bar.
 env note: agent forced to Python 3.14 + torch 2.12.0+cu130 (no 3.14 wheels for 2.6/cu124);
 numbers still valid (warm cuDNN). 13GB venv/cache cleaned. Matte: bench/rmbg2_pytorch_matte_1024.png.
+
+## ═══ ROOFLINE VERDICT (2026-05-30) — CPU is COMPUTE-bound, F16-CPU is dead ═══
+Measured from real prof_cpu.csv (331 MUL_MAT nodes = 5.28s/52.9%). See bench/ROOFLINE.md.
+- CPU MUL_MAT achieved bandwidth = 6.6–21% of ceiling; arithmetic intensity 19–69 (right
+  of Zen3 ridge) → COMPUTE-bound, not bandwidth-bound.
+- Therefore F16 weights on CPU = ~0% speedup (halves idle bytes; Zen3 upcasts to F32 for
+  every FMA regardless — no native F16 math). NO-GO. (Also SIGSEGVs at load today.)
+- **CPU floor = 9.9s is REAL and fully evidenced.** All lossless levers exhausted with
+  numbers: ISA optimal (-march=znver3), threads tuned (6), BLAS measured 2% slower, F16
+  roofline-dead. Only remaining CPU lever = selective int8 quant (lossy, out of scope).
+- GPU gap (695 vs PyTorch 248ms) is NOT matmul/F16-compute — it's the decoder conv kernels
+  (CONV_2D_DEFORM 46% + CONV_2D 39%); cuDNN beats ours. That ~450ms is the real GPU prize,
+  and shrinking the im2col scratch there ALSO cuts peak VRAM (helps the evict-deploy OOM margin).
+
+## DEPLOY ARCHITECTURE (settling) — worker-isolated lazy-evict GPU service
+- Even pessimistic cold-load (~2-3s CUDA ctx init + 0.7s infer) BEATS CPU resident (9.9s) →
+  GPU-evict wins regardless. Warm-in-batch ~14×.
+- Target: worker-isolation (fork+SIGKILL like siglip2/tts/parakeet) → server holds NO cuda
+  ctx, true-0 VRAM when idle, UNGUARDED (nothing persists to race the LLM), batch-aware
+  (load once, N images, evict). No gate entry needed (vs resident services which gate).
+- Open measurements (task #26): cold-load wall time, does /unload truly reclaim, peak after
+  scratch-tune. GPU conv-kernel work (toward cuDNN-class) is the speed+VRAM prize.
