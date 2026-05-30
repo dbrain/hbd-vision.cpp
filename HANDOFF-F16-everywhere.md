@@ -33,6 +33,32 @@
 #   0.17s, warm infer ~1.2s e2e (internal birefnet_compute ~1.3s; the docs' "700ms"
 #   internal does NOT reproduce on the current binary — flagged, not load-bearing).
 #
+# DEEPER LEVERS (2026-05-31, all MEASURED on the RTX 3060):
+#   - ASPP conv1 split (same identity, 1280->64 1x1 over the 5-way [256,256,1280] concat):
+#     peak 1480 -> 1440 MiB (-40), YAVG 181.43, PSNR 60dB. Lossless, committed (c0afb60).
+#     conv_1x1_split_sum helper added to birefnet.cpp (reusable for any 1x1-over-concat).
+#   - swin rel-pos-mask REPEAT removal (encoder): peak UNCHANGED 1480 -> DISPROVEN, reverted.
+#     The encoder is NOT the binding peak (encoder/decoder passes are sequential).
+#   - ipt_blk1 full-res path: probe (VISP_NOIPT, skip the path) left peak at 1480 -> DISPROVEN.
+#     Costs ~200ms compute but its VRAM is not binding.
+#   => After the head fusion the peak is a BROAD PLATEAU of medium (64-256MiB) buffers
+#      (deform working sets + persistent 2-pass Swin features + decoder intermediates), not a
+#      single giant. Cheap concat-splits net only ~40 MiB each. The cheap lossless bucket is
+#      effectively bottomed at ~1440 MiB.
+#   - F16 ceiling (measured by op-type, no off-the-shelf conv2d F16 exists — llama.cpp #19505
+#     only does transformer activation ops): ~62% of big-buffer traffic is F16-capable
+#     (ADD/CONT/CONCAT/UNARY), ~38% F32-locked (MUL_MAT/SOFT_MAX/CONV/DEFORM). Optimistic
+#     ceiling ~1000-1100 MiB, i.e. only ~350-450 MiB below 1440, for multi-week custom
+#     conv2d/im2col F16 work in the shared fork. Bounded; NOT clearly sub-1GB. (The old
+#     "F16 = key to 1.7GB" claim is moot — algebra already beat it.)
+#   - PERF breakdown: e2e warm ~1231ms = ~1224ms (IPC+compute, compute dominates, IPC <5ms)
+#     + ~7ms (decode+post-proc+PNG+HTTP combined). There is NO fat overhead to trim — it's
+#     ~98% GPU graph compute. Big perf wins require better conv/deform kernels (the cuDNN gap,
+#     PROFILE.md: deform 46% + conv 39%) = multi-week, exceeds a medium-effort cap.
+#   SUB-1GB PATHS (both deliberate, NOT done): (A) F16 custom conv kernels -> ~1000 ceiling,
+#     multi-week, shared-fleet regression risk; (B) decoder spatial tiling -> lossless,
+#     birefnet-local, multi-hour, could go lower but real restructure with halo handling.
+#
 # REMAINING (task 5, better with user awake): docker image for matting-server; wire into
 #   kobbler/koblem; push dbrain/ggml consolidated-v0.13 (af69870c, UNPUSHED) + pin submodule;
 #   fork -> dbrain/hbd-vision.cpp; remove any temp debug header (current server has none).
