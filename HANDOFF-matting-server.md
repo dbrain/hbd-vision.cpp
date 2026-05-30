@@ -128,6 +128,32 @@ NEVER report a perf number without confirming the output PNG is a correct matte.
 4. Wire matting-server e2e + docker + final report; remove temp debug header; fork push
    to dbrain/hbd-vision.cpp.
 
+## GPU PEAK VRAM REDUCTION — LANDED (2026-05-30, see bench/VRAM.md)
+Top priority was cutting GPU peak VRAM (worker-isolated evict service must fit the free-VRAM
+window under the heavy services). Self-verified (nvidia-smi per-proc peak + host-ffmpeg YAVG +
+ffmpeg PSNR/md5):
+- **Peak 3606 -> 3072 MiB (-534 / -15%)** at full 1024 res, ~+22 ms (695->717). Shipped as
+  compiled default `VISP_IM2COL_MAX=128` (MiB of the F32 im2col matrix; 0 disables).
+  `src/visp/nn.cpp conv_2d()` routes a k>1 conv to streaming `ggml_conv_2d_direct` (no im2col
+  buffer) when its im2col matrix would exceed the threshold. Branch matting-birefnet.
+- **Quality = near-lossless, NOT bit-exact.** PSNR cat 54.5 / vase 44.1 / wardrobe 67.4 dB,
+  md5 differs on all 3 (direct kernel vs im2col+mul_mat differ in F16-weight/accum order ->
+  sub-perceptual edge noise). YAVG 181.090->181.083, visually identical clean silhouette (Read).
+  Passes the gate (YAVG~181 + clean).
+- **Phase-1 decomposition:** the peak is the BiRefNet decoder OUTPUT HEAD (CONCAT
+  [1024,1024,240]=960 MiB + UPSCALE [1024,1024,192]=768 MiB + full-res convs at 1024^2),
+  genuine F32 activations, NOT im2col scratch (only 2 IM2COL nodes exist, 12+3 MiB).
+- **Floor = 3072 MiB, flat below threshold 128** (more convs->direct only adds latency).
+  Below 3072 needs lossy (lower process_res: 768->2288, 512->1308 MiB) or NOT-DONE/flagged
+  big work: F16 activations (est ~1.7-2.0 GB at 1024, risky shared-ggml, SIGSEGVs today) or
+  decoder-head spatial tiling (lossless restructure).
+- Res-peak curve, sweep table, full reasoning + honest ceiling: **bench/VRAM.md**. Harness:
+  `bench/measure_vram.sh` (named container + nvidia-smi per-proc peak + host-ffmpeg YAVG;
+  NOTE the matte is a gray PNG -> signalstats needs format=yuv444p, not format=gray, else YAVG
+  comes back EMPTY -- the handoff's old correctness-check command silently returns nothing).
+- NOTE: the line above ("GPU peak VRAM ~3580 MiB ... 866ms") is the PRE-reduction baseline;
+  the current default build is 3072 MiB / ~717 ms.
+
 ## Process notes
 - Do NOT batch many interdependent bash calls in parallel — one failure cancels all.
 - Verify artifacts on disk before reporting; never invent numbers.
