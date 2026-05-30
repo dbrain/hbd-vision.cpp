@@ -69,6 +69,24 @@
 #     added to fattn.cu (load/index mask by head) — a real shared-ggml CUDA change, but a
 #     FLEET lever (any per-head-bias attention benefits) and it removes the encoder's [n,n]
 #     scores buffers (the 1290 floor) AND speeds the encoder. THIS is the sub-1GB lever.
+#   FA NOW WORKS (2026-05-31, SHIPPED opt-in): per-head-mask support added to fattn MMA F16
+#     (dbrain/ggml 13f25957) + head_dim 32->64 zero-pad in nn.cpp attention (vision 8f56ad3).
+#     VISP_FLASH_ATTENTION=1 -> GPU peak 1440->1294 MiB (-146). Visually-clean matte (YAVG
+#     181.2) but F16 K/V -> near-, not bit-lossless (PSNR 24-67 dB by image), so OPT-IN: the
+#     worker defaults FA off (lossless 1440); container sets =1 for the 1294 low-VRAM mode.
+#   CORRECTED ROADMAP after FA: with FA on, the peak (1294) IS the Swin-encoder full-res pass
+#     floor — a TRANSFORMER (layernorm + QKV/MLP mul_mat + softmax), NOT conv. Therefore:
+#       * F16 CONV (old item ③) targets DECODER convs, which are BELOW the peak -> it will
+#         NOT lower matting's peak (same trap as decoder tiling). Still a FLEET win for
+#         conv-heavy models (flux2 etc.), just not for matting VRAM.
+#       * The matting sub-1GB lever is F16 TRANSFORMER ACTIVATIONS in the Swin encoder:
+#         additive F16 in/out for NORM, SOFT_MAX, SCALE (the F32-locked ops in the encoder),
+#         then thread F16 activations through swin.cpp. This is the ggml-org #19505 direction
+#         and a FLEET win (the LLM benefits most). Multi-week; ggml-org may land it upstream.
+#   REAL-WORLD OOM MATH (user's box): 6.5-7.5GB resident + up to one 4.5GB gated service.
+#     Worst case 7.5+4.5 ~= 12GB -> NOTHING fits (even sub-1GB), needs gating/evict-timing.
+#     Common case (resident only, ungated slot ~4.5GB free): matting 1294/1440 ALREADY fits.
+#     => VRAM returns are diminishing; 1294-1440 is good-enough for the realistic ungated slot.
 #   SUB-1GB PATHS (all deliberate, multi-day, NOT done; pick in this order):
 #     (0) Swin-encoder FA via per-head-mask fattn.cu + head_dim<64 zero-pad (NEW, best:
 #         attacks the 1290 floor, fleet-wide VRAM+perf, additive to ggml). Est: removes the
