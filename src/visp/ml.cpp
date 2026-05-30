@@ -2,6 +2,8 @@
 #include "util/string.h"
 #include "visp/platform.h"
 
+#include <ggml-cpu.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -632,9 +634,16 @@ struct op_profiler {
 void compute(compute_graph const& g, backend_device const& b) {
     if (char const* env = getenv("VISP_PROFILE_OPS"); env && *env) {
         ggml_backend_t backend = b.handle.get();
-        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        // ggml_backend_sched requires the LAST backend to be CPU (ggml-backend.cpp assert).
+        // Append a CPU backend so the profiler's standalone sched is valid; ops still run on
+        // the GPU where supported (op_offload=false), CPU only for anything unsupported.
+        ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+        ggml_backend_t backends[2] = { backend, cpu_backend };
+        ggml_backend_buffer_type_t bufts[2] = {
+            ggml_backend_get_default_buffer_type(backend),
+            ggml_backend_get_default_buffer_type(cpu_backend) };
         ggml_backend_sched_ptr sched(
-            ggml_backend_sched_new(&backend, &buft, 1, ggml_graph_size(g.graph), false, false));
+            ggml_backend_sched_new(backends, bufts, 2, ggml_graph_size(g.graph), false, false));
         op_profiler prof(env, backend);
         ggml_backend_sched_set_eval_callback(sched.get(), &op_profiler::callback, &prof);
         ggml_backend_sched_reserve(sched.get(), g.graph);
@@ -642,6 +651,7 @@ void compute(compute_graph const& g, backend_device const& b) {
         prof.last = std::chrono::steady_clock::now();
         ggml_backend_sched_graph_compute(sched.get(), g.graph);
         ggml_backend_synchronize(backend);
+        ggml_backend_free(cpu_backend);
         return;
     }
     ggml_backend_graph_compute(b, g.graph);
