@@ -115,6 +115,39 @@ tensor aspp_module_deformable(model_ref m, tensor x, int padding) {
     return named(m, x);
 }
 
+// A 1x1 conv applied to a channel-wise concat of `parts` equals the sum of per-part
+// 1x1 convs with the weight split along input channels:
+//   conv1x1(concat(parts)) == sum_k conv1x1_k(parts[k])
+// Computing it this way avoids ever materialising the (often large) concat tensor, and
+// lets gallocr free each part right after its matmul instead of holding all of them plus
+// the concat. whcn/GPU 1x1 only; lossless modulo FP add order. The caller guards layout.
+static tensor conv_1x1_split_sum(model_ref m, model_ref conv, std::initializer_list<tensor> parts) {
+    tensor cw = conv.weights("weight"); // whcn [1, 1, IC, OC]
+    int64_t oc = cw->ne[3];
+    tensor w2 = ggml_reshape_2d(m, cw, cw->ne[2], oc); // [IC, OC]
+    tensor acc = nullptr;
+    int64_t off = 0;
+    for (tensor p : parts) {
+        auto [w, h, c, b] = nelements(p);
+        tensor ws = ggml_cont(m, ggml_view_2d(m, w2, c, oc, w2->nb[1], off * w2->nb[0]));
+        tensor xc = ggml_cont(m, permute_whcn_to_cwhn(m, p)); // [C, W, H, B]
+        xc = ggml_reshape_2d(m, xc, c, w * h * b);            // [C, W*H*B]
+        tensor y = ggml_mul_mat(m, ws, xc);                  // [OC, W*H*B]
+        y = ggml_reshape_4d(m, y, oc, w, h, b);              // [OC, W, H, B]
+        y = ggml_cont(m, permute_cwhn_to_whcn(m, y));        // [W, H, OC, B]
+        acc = acc ? tensor(ggml_add(m, acc, y)) : y;
+        off += c;
+    }
+    if (tensor bias = conv.find("bias")) {
+        bias = ggml_reshape_4d(m, bias, 1, 1, oc, 1);
+        if (bias->type != acc->type) {
+            bias = ggml_cast(m, bias, acc->type);
+        }
+        acc = ggml_add(m, acc, bias);
+    }
+    return acc;
+}
+
 tensor aspp_deformable(model_ref m, tensor x) {
     const int kernel_sizes[] = {1, 3, 7};
     const int channel_dim = is_cwhn(m) ? 0 : 2;
@@ -131,9 +164,17 @@ tensor aspp_deformable(model_ref m, tensor x) {
     x5 = contiguous_2d_to_whcn(m, x5);
     x5 = interpolate(m, x5, {w1, h1}, bilinear_align_corners);
     x5 = whcn_to_contiguous_2d(m, x5);
-    x = concat(m, {x1, x_deforms[0], x_deforms[1], x_deforms[2], x5}, channel_dim);
 
-    x = conv_2d_batch_norm(m["conv1"], x);
+    // conv1 is a 1x1 conv over the 5-way concat (e.g. [256,256,1280] = 320 MiB at the
+    // highest decoder block). Split it so the concat is never materialised — this is the
+    // graph's binding peak after the output-head fusion (bench/VRAM.md). whcn/GPU only.
+    tensor cw1 = m["conv1"].weights("weight");
+    if (is_whcn(m) && cw1->ne[0] == 1 && cw1->ne[1] == 1) {
+        x = conv_1x1_split_sum(m, m["conv1"], {x1, x_deforms[0], x_deforms[1], x_deforms[2], x5});
+    } else {
+        x = concat(m, {x1, x_deforms[0], x_deforms[1], x_deforms[2], x5}, channel_dim);
+        x = conv_2d_batch_norm(m["conv1"], x);
+    }
     x = ggml_relu_inplace(m, x);
     return named(m, x);
 }
