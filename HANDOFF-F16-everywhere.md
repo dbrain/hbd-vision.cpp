@@ -1,3 +1,46 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# OUTCOME (2026-05-31) — VRAM TARGET MET LOSSLESSLY; F16 NOT NEEDED
+# ═══════════════════════════════════════════════════════════════════════════
+# The mission's GOAL was VRAM (peak 3072 -> ~1.6-2.0 GB so the matting worker can be
+# co-resident on the shared 12GB card). F16 was the PROPOSED means. It turned out F16
+# is NOT the right means here, and is no longer needed:
+#
+# WHY F16 was the wrong lever (verified, see "F16 op audit" below / git log):
+#   - On CUDA, CONV_2D and MUL_MAT are F32-in/F32-out and im2col ASSERTS F32 input.
+#     The decoder head is conv-dominated, so F16-ing a buffer just forces a cast back
+#     to F32 at the next conv -> no net peak win without rewriting the shared CUDA
+#     conv/im2col/upscale kernels to F16-accumulate-F32 (multi-week, and risky in the
+#     shared dbrain/ggml that the prod LLM/avatar/TTS/siglip all link).
+#
+# WHAT ACTUALLY WORKED — two lossless ALGEBRAIC identities on the 1x1 output head
+# (conv_out1.0 is 1x1, 240->1), in src/visp/arch/birefnet.cpp decode():
+#   (1) conv1x1(concat[A,B]) == conv_a(A) + conv_b(B)      -> kills [1024,1024,240] concat (960 MiB)
+#   (2) conv1x1(upscale(x))  == upscale(conv1x1(x))        -> kills [1024,1024,192] upscale (768 MiB)
+#       (1x1 conv is channel-linear, bilinear upscale is spatial-linear -> commute)
+#   => GPU PEAK VRAM 3072 -> 1480 MiB (-52%), full 1024 quality, NO precision loss
+#      (YAVG 181.416 == baseline; PSNR 78-81 dB vs pre-change = sub-LSB FP order only).
+#      Below PyTorch fp16's 2840 MiB peak and the ~1.6 GB active target. Latency ~unchanged.
+#   Commits: a7d0ceb (split) + 23a27ad (upscale-commute). Verified on cli AND server.
+#
+# DEPLOY — worker-isolated service SHIPPED & VERIFIED (commit b469f1c,
+#   src/server/birefnet_server.cpp). Parent holds 0 CUDA ctx; model runs in a forked
+#   worker over an AF_UNIX socketpair (12-byte length-prefixed frames); SIGKILL on evict
+#   = true-0 VRAM. Per-request backend (?backend=cpu|gpu, GPU default, CPU uses 0 GPU);
+#   IDLE_UNLOAD_SECONDS=0 default (evict the instant idle) / >0 warm-then-evict /
+#   MATTING_KEEP_RESIDENT; serialized 1-at-a-time with an in_flight gate so overlapping
+#   requests reuse ONE warm worker (no load/unload churn); batch = multipart N images ->
+#   one load, N infers, JSON of base64 PNGs. Timings (RTX 3060): cold load 0.52s, unload
+#   0.17s, warm infer ~1.2s e2e (internal birefnet_compute ~1.3s; the docs' "700ms"
+#   internal does NOT reproduce on the current binary — flagged, not load-bearing).
+#
+# REMAINING (task 5, better with user awake): docker image for matting-server; wire into
+#   kobbler/koblem; push dbrain/ggml consolidated-v0.13 (af69870c, UNPUSHED) + pin submodule;
+#   fork -> dbrain/hbd-vision.cpp; remove any temp debug header (current server has none).
+# FURTHER VRAM (optional, diminishing): new peak 1480 is distributed 256^2 decoder + 2x Swin
+#   encoder buffers (no single giant left). F16 is now only a small marginal play on those;
+#   the cheap lossless head wins are banked.
+# ═══════════════════════════════════════════════════════════════════════════
+
 # MISSION: F16 activations/compute everywhere — vision.cpp BiRefNet/RMBG-2.0 matting
 
 You are a fresh orchestrator picking up a well-scoped, high-value, multi-week effort.
