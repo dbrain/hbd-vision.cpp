@@ -19,14 +19,14 @@ static int64_t im2col_max_elems() {
         // direct kernel is much slower but VRAM-free; im2col+cuBLAS is fast but needs the
         // buffer. MEASURED on the post-fusion graph (cat-and-hat @1024, GPU):
         // Measured warm (matting server, +F16 encoder), peak VRAM / warm-ms:
-        //   VISP_IM2COL_MAX=128  -> 1276 MiB / 1146 ms  (DEFAULT: min VRAM, co-resident-safe)
-        //   VISP_IM2COL_MAX=2048 -> 1450 MiB /  698 ms  (-448 ms for +174 MiB — the snappy pick)
+        //   VISP_IM2COL_MAX=2048 -> 1450 MiB /  698 ms  (DEFAULT: best perf/VRAM balance)
+        //   VISP_IM2COL_MAX=128  -> 1276 MiB / 1146 ms  (-174 MiB for +448 ms — min VRAM)
         //   VISP_IM2COL_MAX=0    -> 2436 MiB /  ~667 ms  (always im2col, fastest)
         // CONV_2D dominates runtime on the direct kernel; raising this routes the big decoder
-        // convs to im2col+cuBLAS (faster, more VRAM). Default 128 favours VRAM (the matting
-        // service shares the card); set VISP_IM2COL_MAX=2048 for the big speedup at +174 MiB.
+        // convs to im2col+cuBLAS (faster, more VRAM). Default 2048 = the snappy balance;
+        // set VISP_IM2COL_MAX=128 to reclaim 174 MiB if the card gets tight.
         char const* e = getenv("VISP_IM2COL_MAX"); // MiB
-        double mib = e ? atof(e) : 128.0;
+        double mib = e ? atof(e) : 2048.0;
         cached = mib > 0 ? (int64_t)(mib * 1024.0 * 1024.0 / 4.0) : 0; // F32 elems
     }
     return cached;
