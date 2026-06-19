@@ -270,7 +270,7 @@ static bool recv_frame(int fd, FrameHeader* hdr, std::vector<uint8_t>* payload, 
 // fork + execv self with `--worker <fd> --model <m> --backend <bt> [--threads N]`.
 // Returns child pid, sets *out_fd to the parent end of the socketpair. -1 on failure.
 static pid_t spawn_worker(const char* self_argv0, const ServerConfig& cfg,
-                          backend_type bt, int* out_fd) {
+                          backend_type bt, int* out_fd, const std::string& gpu) {
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
     int parent_fd = sv[0], worker_fd = sv[1];
@@ -281,6 +281,7 @@ static pid_t spawn_worker(const char* self_argv0, const ServerConfig& cfg,
     if (pid < 0) { ::close(sv[0]); ::close(sv[1]); return -1; }
     if (pid == 0) {
         ::close(parent_fd);
+        if (!gpu.empty()) ::setenv("CUDA_VISIBLE_DEVICES", gpu.c_str(), 1);
         char fdbuf[16]; std::snprintf(fdbuf, sizeof(fdbuf), "%d", worker_fd);
         char thbuf[16]; std::snprintf(thbuf, sizeof(thbuf), "%d", cfg.n_threads);
         const char* btstr = (bt == backend_type::cpu) ? "cpu" : "gpu";
@@ -523,6 +524,9 @@ struct ServerState {
     int          worker_fd  = -1;
     backend_type worker_bt  = backend_type::gpu;
     std::string  worker_backend_name;
+    std::string  default_gpu;   // WORKER_DEFAULT_GPU (UUID) for un-targeted requests
+    std::string  next_gpu;      // pending per-request target (mtx)
+    std::string  worker_gpu;    // GPU the live worker is pinned to (mtx)
     int          worker_native_size = 0;
     uint32_t     next_req_id = 1;
 
@@ -550,14 +554,17 @@ struct ServerState {
     // caller holds mtx. Ensures a live worker on backend `bt`; respawns on mismatch.
     // throws std::runtime_error on failure.
     void ensure_worker_locked(backend_type bt) {
-        if (worker_pid > 0 && worker_bt == bt) return;
+        const std::string want_gpu = next_gpu.empty() ? default_gpu : next_gpu;
+        if (worker_pid > 0 && worker_bt == bt && worker_gpu == want_gpu) return;
         if (worker_pid > 0) {
-            fprintf(stderr, "[matting] backend switch %s -> %s, respawning worker\n",
-                    worker_backend_name.c_str(), bt == backend_type::cpu ? "cpu" : "gpu");
+            fprintf(stderr, "[matting] respawn worker (backend %s->%s, gpu '%s'->'%s')\n",
+                    worker_backend_name.c_str(), bt == backend_type::cpu ? "cpu" : "gpu",
+                    worker_gpu.c_str(), want_gpu.c_str());
             kill_worker_locked();
         }
         int fd = -1;
-        pid_t pid = spawn_worker(self_path.c_str(), cfg, bt, &fd);
+        pid_t pid = spawn_worker(self_path.c_str(), cfg, bt, &fd, want_gpu);
+        worker_gpu = want_gpu;
         if (pid < 0) throw std::runtime_error("failed to spawn worker");
         // Wait for HELLO (or an error / EOF if load crashed).
         FrameHeader hdr{}; std::vector<uint8_t> payload; IpcError e;
@@ -713,6 +720,10 @@ int main(int argc, char** argv) {
     ServerState st;
     st.cfg = cfg;
     st.self_path = argv[0];
+    if (const char* g = std::getenv("WORKER_DEFAULT_GPU")) {
+        st.default_gpu = g;
+        fprintf(stderr, "[matting] default GPU = %s\n", g);
+    }
     st.worker_bt = cfg.default_backend;
 
     httplib::Server srv;
@@ -790,6 +801,10 @@ int main(int argc, char** argv) {
         int64_t t0 = ggml_time_us();
         try {
             std::scoped_lock lk(st.mtx);
+            // Per-request GPU target (gate placement) — relocate on mismatch.
+            { std::string g = req.has_file("gpu") ? req.get_file_value("gpu").content
+                                                  : req.get_param_value("gpu");
+              if (!g.empty()) st.next_gpu = g; }
             st.ensure_worker_locked(p.backend);
             for (size_t i = 0; i < imgs.size(); ++i) {
                 int rw = 0, rh = 0;
