@@ -757,6 +757,16 @@ int main(int argc, char** argv) {
         send_json(res, 200, body);
     });
 
+    // GPU residency announce for the koblem gate.
+    srv.Get("/v1/gpu/status", [&](const httplib::Request&, httplib::Response& res) {
+        bool alive; std::string gpu;
+        { std::scoped_lock lk(st.mtx); alive = st.worker_alive(); gpu = st.worker_gpu; }
+        json body = {{"loaded", alive}};
+        if (alive && !gpu.empty()) body["gpu"] = gpu;
+        else                       body["gpu"] = nullptr;
+        send_json(res, 200, body);
+    });
+
     auto do_unload = [&](httplib::Response& res) {
         bool was;
         { std::scoped_lock lk(st.mtx); was = st.worker_alive(); st.kill_worker_locked(); }
