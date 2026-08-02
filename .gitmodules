@@ -4,4 +4,5 @@
 	branch = master
 [submodule "depend/sam3.cpp"]
 	path = depend/sam3.cpp
-	url = https://github.com/PABannier/sam3.cpp
+	url = https://github.com/dbrain/sam3.cpp
+	branch = gpu-backend-support

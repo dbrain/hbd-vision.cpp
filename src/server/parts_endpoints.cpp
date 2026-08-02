@@ -21,18 +21,18 @@
 //
 // One image, not N: the caller sends every phrase it wants in a single request
 // because SAM 3 encodes the image once and then runs a cheap prompt-conditioned
-// decode per phrase. Splitting the phrases across requests pays the ~80-95 s CPU
-// encode again each time, so the API deliberately has no single-prompt shape.
+// decode per phrase. Splitting the phrases across requests pays the whole encode
+// again each time, so the API deliberately has no single-prompt shape.
 //
 // Masks come back as 8-bit greyscale PNGs (0 or 255) at the INPUT resolution,
 // one per located instance, each tagged with the phrase that found it. Alpha on
 // the input is ignored — SAM 3 wants the natural render, and the krea2 sprites
 // keep their original background under the cut-out.
 //
-// Backend: this always runs on CPU regardless of `backend`/`gpu`, because
-// sam3.cpp only initializes Metal or CPU. The `gpu` field is still honoured for
-// worker placement so the disabled-card enforcement in the gate keeps working,
-// and `backend` still selects the device the OTHER families use.
+// Backend: sam3.cpp drives its own ggml backend rather than sharing the worker's,
+// so it is handed cpu-or-not and picks the device itself. `gpu` still selects the
+// card for worker placement, which is what keeps the gate's disabled-card
+// enforcement working.
 //
 
 #include "server/endpoints.h"
@@ -260,8 +260,9 @@ void register_parts_routes(httplib::Server& srv, ServerState& st) {
             parts.push_back(std::move(p));
         }
 
+        std::string const backend_name{to_string(backend)};
         res.set_header("X-Parts-Elapsed-Seconds", std::to_string(infer_elapsed));
-        res.set_header("X-Parts-Backend", "cpu");
+        res.set_header("X-Parts-Backend", backend_name);
         send_json(
             res, 200,
             {{"width", img.w},
@@ -273,7 +274,7 @@ void register_parts_routes(httplib::Server& srv, ServerState& st) {
              {"encode_seconds", pr.meta.value("encode_seconds", 0.0)},
              {"decode_seconds", pr.meta.value("decode_seconds", json::array())},
              {"elapsed_seconds", infer_elapsed},
-             {"backend", "cpu"}});
+             {"backend", backend_name}});
     });
 }
 

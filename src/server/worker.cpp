@@ -61,17 +61,12 @@ struct WorkerModels {
     std::unique_ptr<siglip2::TextEncoder> siglip_text;
     std::unique_ptr<siglip2::Tokenizer> siglip_tokenizer;
 
-    // sam3.cpp owns its own ggml backend, so it does not go through
-    // `device`. On this tree that backend is always CPU: sam3.cpp only ever
-    // calls ggml_backend_metal_init() and falls back to the CPU backend
-    // everywhere else. Pointing it at CUDA is not a build flag — its ViT uses
-    // WIN_PART/WIN_UNPART, its PCS scoring head uses POOL_1D, and its
-    // fusion/DETR/mask-decoder attention runs at head_dim 32; none of the four
-    // have a CUDA path, and sam3.cpp computes on a single backend with no
-    // sched fallback, so each is a hard abort rather than a slow path.
+    // sam3.cpp picks its own ggml backend rather than sharing `device`, so it is
+    // told cpu-or-not and finds the device itself.
     std::shared_ptr<sam3_model> sam3;
     sam3_state_ptr sam3_state;
     int sam3_threads = 0;
+    bool sam3_use_gpu = false;
 
     void load_matting() {
         if (matting || cfg.matting_model.empty()) {
@@ -150,7 +145,7 @@ struct WorkerModels {
         }
         sam3_params p;
         p.model_path = cfg.sam3_model;
-        p.use_gpu = false;
+        p.use_gpu = sam3_use_gpu;
         p.n_threads = sam3_threads;
         sam3 = sam3_load_model(p);
         if (!sam3) {
@@ -573,6 +568,7 @@ int run_worker(ServerConfig const& cfg) {
             backend_set_n_threads(*m.device, cfg.n_threads);
         }
         backend_name = std::string(to_string(m.device->type()));
+        m.sam3_use_gpu = m.device->type() != backend_type::cpu;
         // F16 encoder activations are near-lossless and cut both time and peak
         // VRAM, but only CUDA has the kernels: ggml's CPU backend has no F16
         // GGML_OP_NORM and Vulkan no F16 unary, and both hard-abort mid-graph.
