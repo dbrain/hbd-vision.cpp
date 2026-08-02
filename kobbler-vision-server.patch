@@ -1,0 +1,306 @@
+diff --git a/docker-compose.yml b/docker-compose.yml
+index c8b32475..73d8370e 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -2386,26 +2386,44 @@ services:
+       retries: 3
+       start_period: 180s
+ 
+-  # matting — C++/ggml background-removal service (vision.cpp BiRefNet /
+-  # RMBG-2.0). One CUDA binary serves CPU or GPU (MATTING_BACKEND=cpu|gpu|auto).
+-  # koblem reaches it at http://matting:8898 (MATTING_SERVICE_URL on koblem-api),
+-  # which proxies its /api/v1/matting/remove + /matting page. UNGATED — not wired
+-  # into the kob-gpu-gate; the model is tiny (~3.2 GB GPU peak) and idle-unloads
+-  # itself (subprocess-worker pattern: /unload + idle-unload SIGKILL the child so
+-  # VRAM returns to ~0 between requests).
++  # vision-server — C++/ggml multi-model vision service (hbd-vision.cpp). ONE
++  # CUDA binary, ONE worker process, ONE VRAM budget, three endpoints:
++  #
++  #   POST /remove   background removal (BiRefNet / RMBG-2.0)   MATTING_SERVICE_URL
++  #   POST /depth    Depth-Anything V2 (default) or 3, 16-bit  DEPTH_SERVICE_URL
++  #   POST /v1/*     SigLIP2 embeddings/classify                 (NOT wired — see below)
++  #
++  # Was `matting` until DA3 landed. `matting` survives as a network alias, so
++  # koblem's MATTING_SERVICE_URL=http://matting:8898 keeps resolving untouched;
++  # DEPTH_SERVICE_URL is a SEPARATE variable pointing at the same host today so
++  # depth can be split onto another card/host later without touching matting.
++  #
++  # The /v1/* SigLIP2 routes are built in and wire-compatible with the
++  # standalone `siglip2` service above, but koblem's VISION_SERVICE_URL still
++  # points there and should stay pointed there: that service runs so400m from a
++  # different repo (dbrain/hbd-siglip2.cpp) and koblem holds persisted
++  # embeddings that must stay comparable. Migrating is a one-line URL change
++  # plus SIGLIP_HF_REPO/SIGLIP_MODEL_FILE here — deliberately not done blind.
++  #
++  # UNGATED — not wired into the kob-gpu-gate; the models are small and the
++  # worker idle-unloads itself (parent holds no CUDA context, so /unload and the
++  # idle watchdog SIGKILL the child and VRAM returns to true 0).
+   #
+   #   curl localhost:18898/health
+   #
+   # First boot downloads the RMBG-2.0 GGUF from gobeldan/RMBG-2.0-GGUF (~440 MB
+-  # F16) into the matting-models volume; subsequent boots hit the cache.
++  # F16) into the matting-models volume; subsequent boots hit the cache. There
++  # is no published GGUF of either depth model — convert them and drop them in
++  # the volume, or set DEPTH_HF_REPO / DEPTH3_HF_REPO once one exists. /depth
++  # answers 503 for whichever family is missing.
+   #
+   # Source build mirrors siglip2 (same vision.cpp tree): clones
+   # dbrain/hbd-vision.cpp @ VISION_REF, OR set VISION_SRC=$HOME/dev/vision.cpp
+-  # before `docker compose build matting` to route a local working tree (carries
+-  # src/server/) directly into the COPY (no commit/push needed).
+-  matting:
++  # before `docker compose build vision-server` to route a local working tree
++  # (carries src/server/) directly into the COPY (no commit/push needed).
++  vision-server:
+     build:
+-      context: ./docker/matting
++      context: ./docker/vision-server
+       additional_contexts:
+         # Default: scratch FS → Dockerfile probe falls through to git clone of
+         # VISION_REPO @ VISION_REF. Override (dev iter): host path to the local
+@@ -2418,6 +2436,11 @@ services:
+         VISION_REF: "${VISION_REF:-main}"
+     init: true
+     restart: unless-stopped
++    networks:
++      default:
++        aliases:
++          # Pre-DA3 name. Keeps MATTING_SERVICE_URL=http://matting:8898 working.
++          - matting
+     ports:
+       - "18898:8898"
+     environment:
+@@ -2428,11 +2451,19 @@ services:
+       # RMBG-2.0 GGUF selection — entrypoint fetches this on first boot.
+       MATTING_HF_REPO: "${MATTING_HF_REPO:-gobeldan/RMBG-2.0-GGUF}"
+       MATTING_MODEL_FILE: "${MATTING_MODEL_FILE:-RMBG-2.0-F16.gguf}"
++      # Depth-Anything V2 is /depth's default model; DA3 stays reachable as
++      # ?model=depth-anything-3. No published GGUF for either: leave the repos
++      # empty and copy the converted files into the volume.
++      DEPTH_HF_REPO: "${DEPTH_HF_REPO:-}"
++      DEPTH_MODEL_FILE: "${DEPTH_MODEL_FILE:-Depth-Anything-V2-Small-F16.gguf}"
++      DEPTH3_HF_REPO: "${DEPTH3_HF_REPO:-}"
++      DEPTH3_MODEL_FILE: "${DEPTH3_MODEL_FILE:-Depth-Anything-3-Small-F16.gguf}"
+       LAZY_LOAD: "1"
+       # idle-unload SIGKILLs the worker after N idle seconds so VRAM returns to
+-      # the pre-load floor. Default 0 = evict the instant the server goes idle
+-      # (matting is per-request by design — drop VRAM right after each /remove).
+-      IDLE_UNLOAD_SECONDS: "${MATTING_IDLE_UNLOAD_SECONDS:-0}"
++      # the pre-load floor. MUST stay > 0 now that three families share one
++      # worker: at 0 the worker dies the instant the server goes idle and every
++      # request reloads every model it touches.
++      IDLE_UNLOAD_SECONDS: "${MATTING_IDLE_UNLOAD_SECONDS:-300}"
+     deploy:
+       resources:
+         reservations:
+@@ -2441,6 +2472,8 @@ services:
+               count: 1
+               capabilities: [gpu]
+     volumes:
++      # Name kept from the matting era on purpose — renaming it would discard
++      # the cached RMBG download on every existing deployment.
+       - matting-models:/models
+     healthcheck:
+       test: ["CMD", "curl", "-sf", "http://localhost:8898/health"]
+diff --git a/docker/vision-server/Dockerfile b/docker/vision-server/Dockerfile
+index 806a1f25..3a2db7dc 100644
+--- a/docker/vision-server/Dockerfile
++++ b/docker/vision-server/Dockerfile
+@@ -1,20 +1,30 @@
+ # syntax=docker/dockerfile:1.7
+ #
+-# Multi-stage build for the matting service — C++/ggml background removal
+-# (BiRefNet / RMBG-2.0) on top of Acly/vision.cpp. Wraps the resident
+-# birefnet model in a small httplib server (`matting-server`) mirroring the
+-# siglip2/sd service shape: /remove with all knobs, /health, /unload,
+-# idle-unload watchdog.
++# Multi-stage build for the vision-server service — one C++/ggml binary from
++# hbd-vision.cpp serving three model families off ONE worker process, ONE
++# device and ONE VRAM budget:
++#
++#   POST /remove            background removal (BiRefNet / RMBG-2.0)
++#   POST /depth             Depth-Anything V2 (default) or 3 — 16-bit depth PNG,
++#                           plus a confidence PNG from DA3 only
++#   POST /v1/embeddings     SigLIP2 (also /v1/classify, /v1/text_embeddings,
++#                                    /v1/classify_from_embeddings)
++#
++# Each family loads lazily on first use, so a deployment that only calls
++# /remove pays only for BiRefNet. The parent HTTP process never initializes a
++# backend; a forked worker owns the device, so /unload and the idle watchdog
++# SIGKILL it and VRAM returns to true 0.
+ #
+ # The same binary runs CPU or GPU (`--backend cpu|gpu|auto`, or MATTING_BACKEND
+-# env). We build WITH CUDA so the GPU-vs-CPU bench uses one image; deployment
+-# can pin MATTING_BACKEND=cpu for the ungated-CPU profile (no GPU gate needed).
++# env — the env names stay MATTING_* because they are the binary's contract).
++# We build WITH CUDA so the GPU-vs-CPU bench uses one image; deployment can pin
++# MATTING_BACKEND=cpu for the ungated-CPU profile (no GPU gate needed).
+ #
+-#   stage 1 (builder): nvidia/cuda:12.9.1-devel — static build of matting-server
++#   stage 1 (builder): nvidia/cuda:12.9.1-devel — static build of vision-server
+ #                      with CUDA (sm_86). BUILD_SHARED_LIBS=OFF so the runtime
+ #                      image needs no visioncpp/ggml .so copies.
+ #   stage 2 (runtime): nvidia/cuda:12.9.1-runtime + binary + curl. Entrypoint
+-#                      fetches the GGUF from HF on first start into the
++#                      fetches the GGUFs from HF on first start into the
+ #                      matting-models volume, then execs the server.
+ #
+ # Source delivery (mirrors siglip2): clone dbrain/hbd-vision.cpp @ VISION_REF,
+@@ -62,7 +72,7 @@ RUN if [ -f /tmp/vision_src_probe/CMakeLists.txt ]; then \
+ ENV CCACHE_DIR=/root/.ccache CCACHE_MAXSIZE=20G
+ 
+ # BUILD_SHARED_LIBS=OFF — self-contained binary, no .so to ship.
+-# VISP_SERVER=ON        — builds the matting-server target (src/server).
++# VISP_SERVER=ON        — builds vision-server + the in-tree siglip2 lib (src/server).
+ RUN --mount=type=cache,target=/root/.ccache \
+     cmake -S /src/vision.cpp -B /src/vision.cpp/build \
+         -DCMAKE_BUILD_TYPE=Release \
+@@ -74,7 +84,7 @@ RUN --mount=type=cache,target=/root/.ccache \
+         -DGGML_CUDA=ON \
+         -DGGML_CUDA_FA=ON \
+         -DCMAKE_CUDA_ARCHITECTURES="${MATTING_CUDA_ARCHS}" \
+-    && cmake --build /src/vision.cpp/build --target matting-server vision-cli -j"$(nproc)" \
++    && cmake --build /src/vision.cpp/build --target vision-server vision-cli -j"$(nproc)" \
+     && ccache -s
+ 
+ 
+@@ -93,17 +103,29 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+     && apt-get install -y --no-install-recommends \
+         curl libgomp1 ca-certificates
+ 
+-COPY --from=builder /src/vision.cpp/build/bin/matting-server /usr/local/bin/matting-server
+-COPY --from=builder /src/vision.cpp/build/bin/vision-cli      /usr/local/bin/vision-cli
+-COPY entrypoint.sh /usr/local/bin/matting-entrypoint
+-RUN chmod +x /usr/local/bin/matting-entrypoint
++COPY --from=builder /src/vision.cpp/build/bin/vision-server /usr/local/bin/vision-server
++COPY --from=builder /src/vision.cpp/build/bin/vision-cli    /usr/local/bin/vision-cli
++COPY entrypoint.sh /usr/local/bin/vision-entrypoint
++RUN chmod +x /usr/local/bin/vision-entrypoint
+ 
+-# Defaults. RMBG-2.0 F16 is ~440 MB on disk, ~0.2B params; native res 1024.
++# RMBG-2.0 F16 is ~440 MB on disk, ~0.2B params, native res 1024.
++# DA-V2-Small F16 is 48 MiB, 0.025B params, native res 518 (floor on the SHORTEST
++# side). DA3-Small F16 is 66 MiB, 0.08B params, native res 504 (bounds the LONGEST
++# side). Different axes, so /depth names them process_res_short / process_res_long.
+ #   - MATTING_BACKEND=auto — GPU if present, else CPU. Pin to "cpu" in compose
+ #     for the ungated-CPU profile (always-available, no GPU-gate entry needed).
+-#   - LAZY_LOAD=1 + IDLE_UNLOAD_SECONDS=300 — free the model after 5 min idle.
++#   - IDLE_UNLOAD_SECONDS must stay ABOVE 0 now that three families share one
++#     worker: at 0 the worker dies the instant the server goes idle, so every
++#     request reloads every model it touches.
++#   - DEPTH_HF_REPO / DEPTH3_HF_REPO are deliberately unset: no GGUF of either
++#     depth model is published. Either set them, or drop converted files into
++#     the volume as /models/$DEPTH_MODEL_FILE and /models/$DEPTH3_MODEL_FILE
++#     (see entrypoint.sh). Without one, /depth answers 503 for that family and
++#     the other endpoints are unaffected.
+ ENV MATTING_HF_REPO=gobeldan/RMBG-2.0-GGUF \
+     MATTING_MODEL_FILE=RMBG-2.0-F16.gguf \
++    DEPTH_MODEL_FILE=Depth-Anything-V2-Small-F16.gguf \
++    DEPTH3_MODEL_FILE=Depth-Anything-3-Small-F16.gguf \
+     MATTING_BACKEND=auto \
+     LAZY_LOAD=1 \
+     IDLE_UNLOAD_SECONDS=300 \
+@@ -116,4 +138,4 @@ EXPOSE 8898
+ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s \
+     CMD curl -sf http://localhost:8898/health || exit 1
+ 
+-ENTRYPOINT ["/usr/local/bin/matting-entrypoint"]
++ENTRYPOINT ["/usr/local/bin/vision-entrypoint"]
+diff --git a/docker/vision-server/entrypoint.sh b/docker/vision-server/entrypoint.sh
+index 8135d224..f3430027 100755
+--- a/docker/vision-server/entrypoint.sh
++++ b/docker/vision-server/entrypoint.sh
+@@ -1,36 +1,72 @@
+ #!/bin/sh
+-# matting-entrypoint — first-run GGUF fetch, then exec the server.
++# vision-entrypoint — first-run GGUF fetch, then exec the server.
+ #
+-# On first start the /models volume is empty; we curl the selected BiRefNet
+-# GGUF directly from HF (no python/hf-cli dep). Subsequent boots hit the
+-# cached file in the named volume and skip the download.
++# On first start the /models volume is empty; we curl the selected GGUFs
++# directly from HF (no python/hf-cli dep). Subsequent boots hit the cached
++# files in the named volume and skip the download.
+ #
+-# Model selection:
++# Matting (always fetched — the server refuses to start with no model at all):
+ #   MATTING_HF_REPO    (default gobeldan/RMBG-2.0-GGUF)
+ #   MATTING_MODEL_FILE (default RMBG-2.0-F16.gguf; try RMBG-2.0-F32.gguf for
+ #                       max quality, or an Acly/BiRefNet-GGUF file for the
+ #                       MIT-licensed variant)
++#
++# Depth (both optional — /depth answers 503 for a family whose file is absent):
++#   DEPTH_HF_REPO / DEPTH_MODEL_FILE    Depth-Anything V2, /depth's DEFAULT model
++#                                       (default Depth-Anything-V2-Small-F16.gguf)
++#   DEPTH3_HF_REPO / DEPTH3_MODEL_FILE  Depth-Anything 3, ?model=depth-anything-3
++#                                       (default Depth-Anything-3-Small-F16.gguf)
++#   Both repos are unset: no GGUF of either is published. Convert and drop them
++#   into the volume:
++#     scripts/convert.py depth-anything   <DA-V2-SMALL checkpoint> -q f16
++#     scripts/convert.py depth-anything-3 <DA3-SMALL checkpoint>
++#     docker cp Depth-Anything-V2-Small-F16.gguf vision-server:/models/
++#
++# SigLIP2 (optional — the /v1/* routes answer 503 until both files exist):
++#   SIGLIP_HF_REPO / SIGLIP_MODEL_FILE / SIGLIP_TOKENIZER_FILE.
++#   Left unset in production today: koblem still points VISION_SERVICE_URL at
++#   the standalone `siglip2` service, which serves so400m out of a different
++#   repo. Set these only when migrating that URL over.
++#
+ # Wipe the volume to switch: `docker volume rm kobbler_matting-models`.
+ 
+ set -eu
+ 
+ MODELS_DIR="${MODELS_DIR:-/models}"
+-HF_REPO="${MATTING_HF_REPO:-gobeldan/RMBG-2.0-GGUF}"
+-MODEL_FILE="${MATTING_MODEL_FILE:-RMBG-2.0-F16.gguf}"
+-MODEL_PATH="${MODELS_DIR}/${MODEL_FILE}"
+-
+ mkdir -p "${MODELS_DIR}"
+ 
+-if [ ! -f "${MODEL_PATH}" ]; then
+-    url="https://huggingface.co/${HF_REPO}/resolve/main/${MODEL_FILE}"
+-    echo "[matting] fetching ${url}"
+-    curl -fL --retry 5 --retry-delay 2 -C - -o "${MODEL_PATH}.partial" "${url}"
+-    mv "${MODEL_PATH}.partial" "${MODEL_PATH}"
+-else
+-    echo "[matting] cache hit: ${MODEL_PATH}"
+-fi
++# fetch <repo> <file> -> echoes the local path on success, nothing on failure.
++fetch() {
++    repo="$1"
++    file="$2"
++    dest="${MODELS_DIR}/${file}"
++    if [ -f "${dest}" ]; then
++        echo "[vision] cache hit: ${dest}" >&2
++        echo "${dest}"
++        return 0
++    fi
++    if [ -z "${repo}" ]; then
++        return 0
++    fi
++    url="https://huggingface.co/${repo}/resolve/main/${file}"
++    echo "[vision] fetching ${url}" >&2
++    if curl -fL --retry 5 --retry-delay 2 -C - -o "${dest}.partial" "${url}"; then
++        mv "${dest}.partial" "${dest}"
++        echo "${dest}"
++    else
++        rm -f "${dest}.partial"
++        echo "[vision] WARNING: could not fetch ${file} from ${repo}" >&2
++    fi
++}
++
++MODEL_PATH="$(fetch "${MATTING_HF_REPO:-gobeldan/RMBG-2.0-GGUF}" "${MATTING_MODEL_FILE:-RMBG-2.0-F16.gguf}")"
++DEPTH_MODEL_PATH="$(fetch "${DEPTH_HF_REPO:-}" "${DEPTH_MODEL_FILE:-Depth-Anything-V2-Small-F16.gguf}")"
++DEPTH3_MODEL_PATH="$(fetch "${DEPTH3_HF_REPO:-}" "${DEPTH3_MODEL_FILE:-Depth-Anything-3-Small-F16.gguf}")"
++SIGLIP_MODEL_PATH="$(fetch "${SIGLIP_HF_REPO:-}" "${SIGLIP_MODEL_FILE:-siglip2.gguf}")"
++SIGLIP_TOKENIZER_PATH="$(fetch "${SIGLIP_HF_REPO:-}" "${SIGLIP_TOKENIZER_FILE:-tokenizer.model}")"
+ 
+-export MODEL_PATH="${MODEL_PATH}"
++export MODEL_PATH DEPTH_MODEL_PATH DEPTH3_MODEL_PATH SIGLIP_MODEL_PATH SIGLIP_TOKENIZER_PATH
+ 
+-echo "[matting] starting server on ${HOST:-0.0.0.0}:${PORT:-8898} backend=${MATTING_BACKEND:-auto}"
+-exec /usr/local/bin/matting-server "$@"
++echo "[vision] matting=${MODEL_PATH:-<none>} depth-v2=${DEPTH_MODEL_PATH:-<none>} depth-3=${DEPTH3_MODEL_PATH:-<none>} siglip=${SIGLIP_MODEL_PATH:-<none>}"
++echo "[vision] starting server on ${HOST:-0.0.0.0}:${PORT:-8898} backend=${MATTING_BACKEND:-auto}"
++exec /usr/local/bin/vision-server "$@"

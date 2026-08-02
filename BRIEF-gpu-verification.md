@@ -150,10 +150,16 @@ a 2x wall-clock regression, not as a failure.
 
 ## kobbler / docker-compose.yml
 
-The compose changes are **already made locally but NOT pushed**, and kobbler is **11 commits behind
-origin**, so they sit on a stale base — rebase before trusting them.
+**These changes were deliberately NOT pushed.** They were written on a base 11 commits behind
+origin, and deployment belongs to whoever owns the box. `kobbler-vision-server.patch` in this repo
+is the working diff — apply it, cherry-pick from it, or ignore it and redo the change; it exists so
+the findings below are not rediscovered the hard way, not because it should be applied blind.
 
-What they do:
+**One part is not optional.** `docker/matting/Dockerfile` builds the target **`matting-server`,
+which no longer exists** — the binary is `vision-server` now. That container build is broken
+against current `main` whether or not you take the rest.
+
+What the patch does:
 
 - `docker/matting/` → **`docker/vision-server/`**; compose service `matting` → **`vision-server`**,
   with **`matting` kept as a network alias** so koblem's `MATTING_SERVICE_URL=http://matting:8898`
