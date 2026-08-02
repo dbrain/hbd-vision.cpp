@@ -220,3 +220,50 @@ deliberate decision, not a tidy-up. Related: koblem's `VISION_SERVICE_URL` defau
 8. Anything that regressed. A clear negative is more useful than a reassuring summary — several
    conclusions in this project were overturned by measuring rather than assuming, twice because
    the input was wrong rather than the code.
+
+---
+
+## 12. SAM 3 `/parts` — the CUDA work, and why it wants doing on device
+
+`POST /parts` (commit `f6829d2`) serves SAM 3 concept segmentation: image plus a list of noun
+phrases in, instance masks out. It exists because paperworld's silhouette rig approximates each
+body part with an **ellipse** — measured across 34 parts on 14 real renders, those ellipses are
+**37.7% background**, SAM's masks are **0.0%**. It also finds limbs no silhouette method can:
+a bear's forelimbs merged into its body, an owl's folded wings, a wizard's arms inside sleeves.
+
+**It works today and is far too slow: encode 78–132 s on a 20-thread CPU**, ~2.5 minutes for a
+five-part creature. `-DGGML_CUDA=ON` builds and then **aborts** — sam3.cpp drives a single backend
+via `ggml_gallocr` + `ggml_backend_graph_compute` with **no `ggml_backend_sched`**, so an
+unsupported op is fatal rather than a CPU fallback.
+
+Three known gaps, all **graph rewrites, none needing a new kernel**:
+
+| op | where | replacement |
+|---|---|---|
+| `GGML_OP_WIN_PART` / `WIN_UNPART` | the ViT's windowed attention | pad + reshape + permute + cont |
+| `GGML_OP_POOL_1D` | PCS scoring head's text pooling | `sum_rows` |
+| `FLASH_ATTN_EXT` @ head_dim **32** | fusion encoder, DETR decoder, mask decoder — most of 17 attention sites | `mul_mat` + `soft_max_ext`; **sam3.cpp already implements this as its `rpb_mask` branch** |
+
+`ggml_cuda_get_best_fattn_kernel` has cases for 40/64/72/80/96/112/128/192/256/320/512/576 and
+`default: BEST_FATTN_KERNEL_NONE`, which is literally `GGML_ABORT`. head_dim 32 falls through.
+Expect at least one further gap; find it by running, not by reading.
+
+**NOT a gap:** the F16 `SOFT_MAX` you re-ported for matting is not needed here. sam3 keeps its one
+`soft_max_ext` mask in F32 deliberately (in-source: the F16 mask path loses precision on the
+box-relative positional bias), and its ViT is head_dim 64 with F32 K/V.
+
+**Why this half belongs on the GPU box.** The dev laptop is AMD/Vulkan, so it can verify the
+rewrites are *correct* — the masks must come out byte-identical to the archived CPU results — but
+it cannot verify they *run* on CUDA, and it cannot measure anything. That is the whole question.
+Expected ~2–5 s once the ops land, i.e. 20–50×, but nobody should trust a number extrapolated from
+a path that currently aborts.
+
+**Model:** not published. Convert with sam3.cpp's own script; point `SAM3_MODEL_PATH` at the
+result. `*.ggml` is gitignored. Weight buffer **1748 MB F16 / 1.0 GB q8_0 / 707 MB q4_0**;
+**activation arena unmeasured** — budget ~2.5–3 GB F16 or ~1.7–2 GB q8_0 and verify. If it shares
+the worker with RMBG and DA2 it is a real addition to the `matting` gate row's `peak_mb`.
+
+**SAM 3.1 is not worth chasing:** sam3.cpp hardcodes SAM 3's hparams, and 3.1's changes are all
+video — Object Multiplex is shared-memory joint multi-object *tracking*, explicitly "without
+changing the model architecture" and "without sacrificing accuracy". Nothing in it touches
+single-image PCS. Its checkpoints are also HF access-gated.
