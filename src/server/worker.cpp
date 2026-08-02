@@ -420,23 +420,25 @@ int run_worker(ServerConfig const& cfg) {
             backend_set_n_threads(*m.device, cfg.n_threads);
         }
         backend_name = std::string(to_string(m.device->type()));
-        // F16 encoder activations are near-lossless and cut both time and peak
-        // VRAM (measured on a 3060: -90 MiB / -13% at process_res 1024, -552 MiB
-        // / -11% at 2048), but only CUDA has the kernels: ggml's CPU backend has
-        // no F16 GGML_OP_NORM and Vulkan no F16 unary, and both hard-abort
-        // mid-graph. Vulkan is backend_type::vulkan, not ::gpu, so it takes the
-        // force-off branch.
+        // F16 encoder activations are worth ~96 MiB and ~5% at process_res 1024
+        // (~558 MiB / ~4% at 2048), but they are BROKEN on the current ggml and
+        // this must NOT force them on.
         //
-        // HARD DEPENDENCY on ggml F16 GGML_OP_SOFT_MAX. The v0.18 consolidation
-        // rewrite dropped it and this line then killed the worker on the FIRST
-        // /remove (GGML_ASSERT(src0->type == GGML_TYPE_F32) in softmax.cu, seen
-        // as a 500 "worker died"). Re-ported in ggml 1fbcc8c5 — do not move
-        // depend/ggml back before that commit without also forcing this off.
-        if (m.device->type() == backend_type::gpu) {
-            ::setenv("VISP_F16_ENCODER", "1", 0);
-        } else {
-            ::unsetenv("VISP_F16_ENCODER");
-        }
+        // The v0.18 consolidation rewrite dropped the fork's F16 activation
+        // kernels. Two were re-ported (SOFT_MAX and ROLL, ggml b239ea36) and the
+        // graph now runs to completion — but ggml_cuda_mul_mat_f16_dst was not,
+        // and the generic "non-F32 dst -> ggml_cuda_mul_mat_cublas" fallback is
+        // NOT an equivalent substitute for it. The result is a matte that is
+        // silently near-empty: HTTP 200, correct extent, RGB byte-identical,
+        // mean alpha 13 vs 181, alpha RMSE 203/255 against a known-good matte.
+        // Nothing asserts and nothing logs. A status code does not prove this
+        // path works — compare the ALPHA channel against a reference matte.
+        //
+        // So: default OFF everywhere. Re-enable by force only once
+        // ggml_cuda_mul_mat_f16_dst is back AND the alpha check passes.
+        // (CPU/Vulkan could never run it anyway: ggml's CPU backend has no F16
+        // GGML_OP_NORM and Vulkan no F16 unary, and both hard-abort mid-graph.)
+        ::unsetenv("VISP_F16_ENCODER");
         m.load_matting();
     } catch (std::exception const& ex) {
         std::string msg = std::string("worker load failed: ") + ex.what();
