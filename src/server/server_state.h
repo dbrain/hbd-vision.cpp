@@ -18,6 +18,7 @@ struct ServerConfig {
     std::string siglip_model;
     std::string siglip_tokenizer;
     int siglip_default_max_num_patches = 256;
+    std::string sam3_model; // SAM 3 *.ggml — /parts
 
     std::string host = "0.0.0.0";
     int port = 8898;

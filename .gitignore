@@ -13,6 +13,7 @@ tests/reference
 *.bin
 *.safetensors
 *.gguf
+*.ggml
 *.zip
 *.tar.gz
 *.egg-info

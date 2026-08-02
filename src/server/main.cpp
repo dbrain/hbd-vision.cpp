@@ -15,6 +15,7 @@
 //   POST /v1/admin/load               (re)spawn the worker
 //   POST /remove                      matting (see matting_endpoints.cpp)
 //   POST /depth                       Depth-Anything V2 / 3 (see depth_endpoints.cpp)
+//   POST /parts                       SAM 3 text-prompted parts (see parts_endpoints.cpp)
 //   POST /v1/embeddings               siglip2 (see siglip_endpoints.cpp)
 //   POST /v1/classify
 //   POST /v1/text_embeddings
@@ -26,6 +27,7 @@
 //   DEPTH3_MODEL_PATH / --depth3-model     Depth-Anything-3 *.gguf (?model=depth-anything-3)
 //   SIGLIP_MODEL_PATH / --siglip-model     SigLIP2 *.gguf
 //   SIGLIP_TOKENIZER_PATH / --siglip-tokenizer   sentencepiece tokenizer.model
+//   SAM3_MODEL_PATH / --sam3-model         SAM 3 *.ggml (/parts; CPU-only)
 //   DEFAULT_MAX_NUM_PATCHES                siglip2 NaFlex budget (default 256)
 //   HOST / --host, PORT / --port
 //   MATTING_BACKEND / --backend            cpu | gpu — the DEFAULT per-request backend
@@ -93,6 +95,7 @@ ServerConfig load_config(int argc, char** argv) {
     c.depth3_model = env_str("DEPTH3_MODEL_PATH", "");
     c.siglip_model = env_str("SIGLIP_MODEL_PATH", "");
     c.siglip_tokenizer = env_str("SIGLIP_TOKENIZER_PATH", "");
+    c.sam3_model = env_str("SAM3_MODEL_PATH", "");
     c.siglip_default_max_num_patches = std::atoi(env_str("DEFAULT_MAX_NUM_PATCHES", "256").c_str());
     c.host = env_str("HOST", "0.0.0.0");
     c.port = std::atoi(env_str("PORT", "8898").c_str());
@@ -115,6 +118,7 @@ ServerConfig load_config(int argc, char** argv) {
         else if (a == "--depth3-model") c.depth3_model = next("--depth3-model");
         else if (a == "--siglip-model") c.siglip_model = next("--siglip-model");
         else if (a == "--siglip-tokenizer") c.siglip_tokenizer = next("--siglip-tokenizer");
+        else if (a == "--sam3-model") c.sam3_model = next("--sam3-model");
         else if (a == "--default-max-num-patches")
             c.siglip_default_max_num_patches = std::atoi(next("--default-max-num-patches").c_str());
         else if (a == "--host") c.host = next("--host");
@@ -131,11 +135,12 @@ ServerConfig load_config(int argc, char** argv) {
                 "Usage: %s [--model <birefnet.gguf>] [--depth-model <da2.gguf>]\n"
                 "          [--depth3-model <da3.gguf>]\n"
                 "          [--siglip-model <siglip2.gguf>]\n"
-                "          [--siglip-tokenizer <tokenizer.model>] [--port 8898]\n"
+                "          [--siglip-tokenizer <tokenizer.model>] [--sam3-model <sam3.ggml>]\n"
+                "          [--port 8898]\n"
                 "          [--backend cpu|gpu] [--threads N] [--idle-unload-seconds N]\n"
                 "          [--keep-resident] [--default-max-num-patches N]\n"
                 "  env: MODEL_PATH DEPTH_MODEL_PATH DEPTH3_MODEL_PATH SIGLIP_MODEL_PATH\n"
-                "       SIGLIP_TOKENIZER_PATH HOST PORT\n"
+                "       SIGLIP_TOKENIZER_PATH SAM3_MODEL_PATH HOST PORT\n"
                 "       MATTING_BACKEND MATTING_THREADS IDLE_UNLOAD_SECONDS\n"
                 "       MATTING_KEEP_RESIDENT DEFAULT_MAX_NUM_PATCHES WORKER_DEFAULT_GPU\n",
                 argv[0]);
@@ -159,11 +164,11 @@ int main(int argc, char** argv) {
 
     ServerConfig cfg = load_config(argc, argv);
     if (cfg.matting_model.empty() && cfg.depth_model.empty() && cfg.depth3_model.empty() &&
-        cfg.siglip_model.empty()) {
+        cfg.siglip_model.empty() && cfg.sam3_model.empty()) {
         fprintf(
             stderr,
             "error: at least one of MODEL_PATH / DEPTH_MODEL_PATH / DEPTH3_MODEL_PATH / "
-            "SIGLIP_MODEL_PATH is required\n");
+            "SIGLIP_MODEL_PATH / SAM3_MODEL_PATH is required\n");
         return 2;
     }
 
@@ -180,12 +185,14 @@ int main(int argc, char** argv) {
     }
     st.worker_bt = cfg.default_backend;
 
-    if ((!cfg.siglip_model.empty() || !cfg.depth_model.empty() || !cfg.depth3_model.empty()) &&
+    if ((!cfg.siglip_model.empty() || !cfg.depth_model.empty() || !cfg.depth3_model.empty() ||
+         !cfg.sam3_model.empty()) &&
         cfg.idle_unload_seconds == 0 &&
         !cfg.keep_resident) {
         fprintf(
             stderr,
-            "[vision] WARNING: siglip2/depth enabled with IDLE_UNLOAD_SECONDS=0 — the worker is "
+            "[vision] WARNING: siglip2/depth/sam3 enabled with IDLE_UNLOAD_SECONDS=0 — the worker "
+            "is "
             "evicted the moment the server goes idle, so every request pays a full model "
             "reload. Set IDLE_UNLOAD_SECONDS>0 or MATTING_KEEP_RESIDENT=1.\n");
     }
@@ -221,6 +228,7 @@ int main(int argc, char** argv) {
              {"depth_model", st.cfg.depth_model},
              {"depth3_model", st.cfg.depth3_model},
              {"siglip_model", st.cfg.siglip_model},
+             {"sam3_model", st.cfg.sam3_model},
              {"worker_alive", alive},
              {"model_loaded", alive},
              {"backend", bname},
@@ -276,6 +284,7 @@ int main(int argc, char** argv) {
     register_matting_routes(srv, st);
     register_depth_routes(srv, st);
     register_siglip_routes(srv, st);
+    register_parts_routes(srv, st);
 
     // Idle-evict watchdog: when nothing is running or queued, wait
     // idle_unload_seconds then SIGKILL the worker -> true-0 VRAM.

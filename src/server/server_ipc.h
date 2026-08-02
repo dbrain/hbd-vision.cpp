@@ -19,7 +19,9 @@ enum class Frame : uint32_t {
     SIGLIP_REQ = 0x40, // parent->worker: [u32 json_len][json][concatenated image bytes]
     SIGLIP_RESP = 0x41, // worker->parent: json
     DEPTH_REQ = 0x50,   // parent->worker: [i32 model][i32 image_size][i32 w][i32 h][rgba8 w*h*4]
-    DEPTH_RESP = 0x51   // worker->parent: [i32 w][i32 h][i32 n_maps][f32 depth][f32 conf if n_maps==2]
+    DEPTH_RESP = 0x51,  // worker->parent: [i32 w][i32 h][i32 n_maps][f32 depth][f32 conf if n_maps==2]
+    PARTS_REQ = 0x60,   // parent->worker: [u32 json_len][json][rgba8 w*h*4]
+    PARTS_RESP = 0x61   // worker->parent: [u32 json_len][json][u8 mask w*h per part, in order]
 };
 
 // Which depth family serves a DEPTH_REQ. V2 is the default: on flat-lit matted

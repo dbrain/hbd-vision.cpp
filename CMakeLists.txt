@@ -149,6 +149,7 @@ add_subdirectory(src/visp)
 add_subdirectory(src/cli)
 
 if(VISP_SERVER)
+  add_subdirectory(depend/sam3)
   add_subdirectory(src/siglip2)
   add_subdirectory(src/server)
 endif()

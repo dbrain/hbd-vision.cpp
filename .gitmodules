@@ -2,3 +2,6 @@
 	path = depend/ggml
 	url = https://github.com/dbrain/ggml.git
 	branch = master
+[submodule "depend/sam3.cpp"]
+	path = depend/sam3.cpp
+	url = https://github.com/PABannier/sam3.cpp

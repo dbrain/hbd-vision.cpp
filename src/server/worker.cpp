@@ -1,5 +1,6 @@
 #include "server/worker.h"
 
+#include "sam3.h"
 #include "siglip2/siglip2.h"
 #include "util/string.h"
 #include "visp/vision.h"
@@ -7,11 +8,13 @@
 #include "nlohmann/json.hpp"
 #include "stb_image.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -57,6 +60,18 @@ struct WorkerModels {
     std::unique_ptr<siglip2::VisionEncoder> siglip_vision;
     std::unique_ptr<siglip2::TextEncoder> siglip_text;
     std::unique_ptr<siglip2::Tokenizer> siglip_tokenizer;
+
+    // sam3.cpp owns its own ggml backend, so it does not go through
+    // `device`. On this tree that backend is always CPU: sam3.cpp only ever
+    // calls ggml_backend_metal_init() and falls back to the CPU backend
+    // everywhere else. Pointing it at CUDA is not a build flag — its ViT uses
+    // WIN_PART/WIN_UNPART, its PCS scoring head uses POOL_1D, and its
+    // fusion/DETR/mask-decoder attention runs at head_dim 32; none of the four
+    // have a CUDA path, and sam3.cpp computes on a single backend with no
+    // sched fallback, so each is a hard abort rather than a slow path.
+    std::shared_ptr<sam3_model> sam3;
+    sam3_state_ptr sam3_state;
+    int sam3_threads = 0;
 
     void load_matting() {
         if (matting || cfg.matting_model.empty()) {
@@ -124,6 +139,33 @@ struct WorkerModels {
         fprintf(
             stderr, "[vision-worker] siglip2 loaded: %s (hidden %d)\n", cfg.siglip_model.c_str(),
             siglip->vision.hidden_size);
+    }
+
+    void load_sam3() {
+        if (sam3) {
+            return;
+        }
+        if (cfg.sam3_model.empty()) {
+            throw except("sam3 model not configured (SAM3_MODEL_PATH / --sam3-model)");
+        }
+        sam3_params p;
+        p.model_path = cfg.sam3_model;
+        p.use_gpu = false;
+        p.n_threads = sam3_threads;
+        sam3 = sam3_load_model(p);
+        if (!sam3) {
+            throw except("sam3 load failed: {}", cfg.sam3_model);
+        }
+        if (sam3_is_visual_only(*sam3)) {
+            sam3.reset();
+            throw except("sam3 model is visual-only — /parts needs the text (PCS) head");
+        }
+        sam3_state = sam3_create_state(*sam3, p);
+        if (!sam3_state) {
+            sam3.reset();
+            throw except("sam3 state alloc failed");
+        }
+        fprintf(stderr, "[vision-worker] sam3 loaded: %s\n", cfg.sam3_model.c_str());
     }
 
     std::vector<float> embed_image(
@@ -402,6 +444,115 @@ void handle_depth(WorkerModels& m, int fd, FrameHeader const& hdr, std::vector<u
     send_frame(fd, Frame::DEPTH_RESP, hdr.req_id, resp.data(), resp.size());
 }
 
+// One image encode, then one cheap prompt-conditioned decode per noun phrase.
+// That split is the whole reason a multi-part rig is affordable: on this CPU the
+// 848M ViT encode is ~80-95 s and each additional PCS decode is ~13-17 s, so a
+// five-part creature costs ~1.5 encodes, not five.
+void handle_parts(WorkerModels& m, int fd, FrameHeader const& hdr, std::vector<uint8_t>& payload) {
+    if (payload.size() < 4) {
+        send_error(fd, hdr.req_id, "short parts payload");
+        return;
+    }
+    uint32_t json_len = 0;
+    std::memcpy(&json_len, payload.data(), 4);
+    if (payload.size() < 4 + (size_t)json_len) {
+        send_error(fd, hdr.req_id, "truncated parts payload");
+        return;
+    }
+    json req = json::parse(payload.begin() + 4, payload.begin() + 4 + json_len);
+
+    int const w = req.at("width").get<int>();
+    int const h = req.at("height").get<int>();
+    size_t const npix = (size_t)w * h;
+    if (w <= 0 || h <= 0 || payload.size() != 4 + (size_t)json_len + npix * 4) {
+        send_error(fd, hdr.req_id, "bad parts dimensions");
+        return;
+    }
+    std::vector<std::string> prompts;
+    for (auto const& p : req.at("prompts")) {
+        prompts.push_back(p.get<std::string>());
+    }
+    float const threshold = req.value("threshold", 0.35f);
+    float const nms = req.value("nms", 0.1f);
+    int const max_instances = req.value("max_instances", 0);
+
+    m.load_sam3();
+
+    sam3_image img;
+    img.width = w;
+    img.height = h;
+    img.channels = 3;
+    img.data.resize(npix * 3);
+    uint8_t const* rgba = payload.data() + 4 + json_len;
+    for (size_t i = 0; i < npix; ++i) {
+        img.data[i * 3 + 0] = rgba[i * 4 + 0];
+        img.data[i * 3 + 1] = rgba[i * 4 + 1];
+        img.data[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+
+    int64_t const t_enc0 = ggml_time_us();
+    if (!sam3_encode_image(*m.sam3_state, *m.sam3, img)) {
+        send_error(fd, hdr.req_id, "sam3 image encode failed");
+        return;
+    }
+    double const encode_seconds = (ggml_time_us() - t_enc0) / 1e6;
+
+    json parts = json::array();
+    json decode_seconds = json::array();
+    std::vector<uint8_t> masks;
+    for (auto const& prompt : prompts) {
+        sam3_pcs_params pcs;
+        pcs.text_prompt = prompt;
+        pcs.score_threshold = threshold;
+        pcs.nms_threshold = nms;
+        int64_t const t0 = ggml_time_us();
+        sam3_result r = sam3_segment_pcs(*m.sam3_state, *m.sam3, pcs);
+        decode_seconds.push_back((ggml_time_us() - t0) / 1e6);
+
+        std::stable_sort(
+            r.detections.begin(), r.detections.end(),
+            [](sam3_detection const& a, sam3_detection const& b) { return a.score > b.score; });
+        int kept = 0;
+        for (auto const& d : r.detections) {
+            if (max_instances > 0 && kept >= max_instances) {
+                break;
+            }
+            if (d.mask.width != w || d.mask.height != h || d.mask.data.size() != npix) {
+                send_error(fd, hdr.req_id, "sam3 returned a mask at an unexpected resolution");
+                return;
+            }
+            size_t area = 0;
+            for (uint8_t v : d.mask.data) {
+                area += v ? 1 : 0;
+            }
+            if (area == 0) {
+                continue; // a box with no pixels animates nothing
+            }
+            parts.push_back(json{
+                {"name", prompt},
+                {"score", d.score},
+                {"box", {d.box.x0, d.box.y0, d.box.x1, d.box.y1}},
+                {"area", (uint64_t)area}});
+            masks.insert(masks.end(), d.mask.data.begin(), d.mask.data.end());
+            ++kept;
+        }
+    }
+
+    json resp = {
+        {"width", w},
+        {"height", h},
+        {"parts", std::move(parts)},
+        {"encode_seconds", encode_seconds},
+        {"decode_seconds", std::move(decode_seconds)}};
+    std::string rs = resp.dump();
+    std::vector<uint8_t> out(4 + rs.size() + masks.size());
+    uint32_t const rlen = (uint32_t)rs.size();
+    std::memcpy(out.data(), &rlen, 4);
+    std::memcpy(out.data() + 4, rs.data(), rs.size());
+    std::memcpy(out.data() + 4 + rs.size(), masks.data(), masks.size());
+    send_frame(fd, Frame::PARTS_RESP, hdr.req_id, out.data(), out.size());
+}
+
 } // namespace
 
 int run_worker(ServerConfig const& cfg) {
@@ -413,6 +564,8 @@ int run_worker(ServerConfig const& cfg) {
 
     WorkerModels m;
     m.cfg = cfg;
+    m.sam3_threads =
+        cfg.n_threads > 0 ? cfg.n_threads : (int)std::max(1u, std::thread::hardware_concurrency());
     std::string backend_name;
     try {
         m.device = std::make_unique<backend_device>(backend_init(cfg.default_backend));
@@ -480,6 +633,8 @@ int run_worker(ServerConfig const& cfg) {
             } else if (ft == Frame::SIGLIP_REQ) {
                 std::string out = handle_siglip(m, payload).dump();
                 send_frame(fd, Frame::SIGLIP_RESP, hdr.req_id, out.data(), out.size());
+            } else if (ft == Frame::PARTS_REQ) {
+                handle_parts(m, fd, hdr, payload);
             }
         } catch (std::exception const& ex) {
             send_error(fd, hdr.req_id, ex.what());
