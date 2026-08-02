@@ -231,22 +231,49 @@ body part with an **ellipse** — measured across 34 parts on 14 real renders, t
 **37.7% background**, SAM's masks are **0.0%**. It also finds limbs no silhouette method can:
 a bear's forelimbs merged into its body, an owl's folded wings, a wizard's arms inside sleeves.
 
-**It works today and is far too slow: encode 78–132 s on a 20-thread CPU**, ~2.5 minutes for a
-five-part creature. `-DGGML_CUDA=ON` builds and then **aborts** — sam3.cpp drives a single backend
-via `ggml_gallocr` + `ggml_backend_graph_compute` with **no `ggml_backend_sched`**, so an
-unsupported op is fatal rather than a CPU fallback.
+**Status: the four gaps are closed** (`7e696c7`; `depend/sam3.cpp` now points at
+`dbrain/sam3.cpp` branch `gpu-backend-support` @ `09b80ad`). It runs on Vulkan here. What is left
+is CUDA itself.
 
-Three known gaps, all **graph rewrites, none needing a new kernel**:
+Measured on the dev box (Radeon 890M, RADV), 1008 square encode:
 
-| op | where | replacement |
+| | encode | decode/prompt |
 |---|---|---|
-| `GGML_OP_WIN_PART` / `WIN_UNPART` | the ViT's windowed attention | pad + reshape + permute + cont |
-| `GGML_OP_POOL_1D` | PCS scoring head's text pooling | `sum_rows` |
-| `FLASH_ATTN_EXT` @ head_dim **32** | fusion encoder, DETR decoder, mask decoder — most of 17 attention sites | `mul_mat` + `soft_max_ext`; **sam3.cpp already implements this as its `rpb_mask` branch** |
+| CPU | 12.9 s cold | 1.8 s |
+| **Vulkan iGPU** | **3.6-7.3 s** (mean 5.3) | **0.9-1.4 s** (mean 1.07) |
+| Vulkan, FA forced off (worst-case CUDA shape) | 7.1-8.7 s | 1.2-1.8 s |
 
-`ggml_cuda_get_best_fattn_kernel` has cases for 40/64/72/80/96/112/128/192/256/320/512/576 and
-`default: BEST_FATTN_KERNEL_NONE`, which is literally `GGML_ABORT`. head_dim 32 falls through.
-Expect at least one further gap; find it by running, not by reading.
+End-to-end through `POST /parts`, owl with 3 prompts: **7.3 s**. CUDA should sit nearer the Vulkan
+row than the FA-off row, because only the head_dim-32 sites take the fallback and the ViT — which
+dominates — keeps its native head_dim-64 kernel.
+
+What was closed, for context when reading the diff:
+
+| gap | fix |
+|---|---|
+| no GPU backend init at all (Metal only) | `ggml_backend_init_best()` — note `init_by_type(GPU)` returns null on a UMA part, which registers as `IGPU` |
+| `GGML_OP_WIN_PART` / `WIN_UNPART` | one strided `ggml_view_4d` + `ggml_cont`; `ggml_pad` only when not a window multiple |
+| `GGML_OP_POOL_1D` | `ggml_sum_rows` + `ggml_scale(1/T)` |
+| `FLASH_ATTN_EXT` @ head_dim 32 | **conditional** — builds the FA node, asks `ggml_backend_supports_op`, materialises the scores matrix only when the device says no. This is why CPU output is byte-identical. |
+| `worker.cpp` hardcoded `p.use_gpu = false` | follows the worker's real device; `/parts` no longer reports `"backend": "cpu"` unconditionally |
+
+`SAM3_NO_FLASH_ATTN=1` forces the fallback path — the only way to exercise CUDA's graph shape on
+hardware that supports head_dim 32.
+
+**WHAT IS LEFT FOR CUDA, and only CUDA can answer it:**
+
+1. **Does it run.** Vulkan is strong evidence — it rejects `WIN_PART`/`POOL_1D` identically and now
+   executes the whole graph — but Vulkan *accepts* head_dim 32, so the fallback only ran there
+   under `SAM3_NO_FLASH_ATTN=1`. On CUDA it must trigger by itself via `supports_op`.
+2. **Are CUDA's `supports_op` answers what we read them to be.**
+   `ggml_cuda_flash_attn_ext_supported` → `get_best_fattn_kernel` was read to return `NONE` rather
+   than abort, so the probe should work — never executed.
+3. **VRAM: the activation arena is still unmeasured on any backend.** The fenc self-attention
+   materialises a scores matrix on the fallback path, so the CUDA figure may exceed the Vulkan one.
+   Weight buffer is 1748 MB F16 / 1.0 GB q8_0 / 707 MB q4_0. If `/parts` shares the worker with
+   RMBG and DA2, this is a real addition to the `matting` gate row's `peak_mb`.
+4. **SAM2 / EdgeTAM** went through the same helper and no model exists here to test. Behaviour-
+   preserving on CPU by construction; only a GPU run exercises it.
 
 **NOT a gap:** the F16 `SOFT_MAX` you re-ported for matting is not needed here. sam3 keeps its one
 `soft_max_ext` mask in F32 deliberately (in-source: the F16 mask path loses precision on the
