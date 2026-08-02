@@ -1,0 +1,15 @@
+# Keeps the dev-iteration build context small when a host checkout is passed in
+# via `--build-context vision_src=$HOME/dev/vision.cpp`. Without this the COPY
+# drags ~3.2 GB of local build trees and downloaded GGUFs into the builder.
+#
+# The Dockerfile also purges build dirs after the COPY — that is the load-bearing
+# guard (a stale CMakeCache.txt names the host's source path and makes cmake
+# refuse to configure). This file is the speed half of the same problem.
+build/
+build-*/
+models/
+.git/
+.venv/
+__pycache__/
+*.o
+*.so

@@ -421,9 +421,17 @@ int run_worker(ServerConfig const& cfg) {
         }
         backend_name = std::string(to_string(m.device->type()));
         // F16 encoder activations are near-lossless and cut both time and peak
-        // VRAM, but only CUDA has the kernels: ggml's CPU backend has no F16
-        // GGML_OP_NORM and Vulkan no F16 unary, and both hard-abort mid-graph.
-        // Vulkan is backend_type::vulkan, not ::gpu, so it takes the force-off branch.
+        // VRAM (measured on a 3060: -90 MiB / -13% at process_res 1024, -552 MiB
+        // / -11% at 2048), but only CUDA has the kernels: ggml's CPU backend has
+        // no F16 GGML_OP_NORM and Vulkan no F16 unary, and both hard-abort
+        // mid-graph. Vulkan is backend_type::vulkan, not ::gpu, so it takes the
+        // force-off branch.
+        //
+        // HARD DEPENDENCY on ggml F16 GGML_OP_SOFT_MAX. The v0.18 consolidation
+        // rewrite dropped it and this line then killed the worker on the FIRST
+        // /remove (GGML_ASSERT(src0->type == GGML_TYPE_F32) in softmax.cu, seen
+        // as a 500 "worker died"). Re-ported in ggml 1fbcc8c5 — do not move
+        // depend/ggml back before that commit without also forcing this off.
         if (m.device->type() == backend_type::gpu) {
             ::setenv("VISP_F16_ENCODER", "1", 0);
         } else {
