@@ -69,12 +69,10 @@ VISP_API void backend_set_n_threads(backend_device&, int n_threads);
 enum class model_build_flag {
     // clang-format off
     cwhn                = 1 << 0,
-    conv_2d_direct_cwhn = 1 << 1,
-    concat_n            = 1 << 2,
-    f16_conv_transpose  = 1 << 3,
-    window_partition    = 1 << 4,
-    flash_attention     = 1 << 5,
-    f16_activations     = 1 << 6  // run activations in F16 (mul_mat F16 dst + F16 norm/softmax/scale)
+    f16_conv_transpose  = 1 << 1,
+    window_partition    = 1 << 2,
+    flash_attention     = 1 << 3,
+    f16_activations     = 1 << 4  // run activations in F16 (mul_mat F16 dst + F16 norm/softmax/scale)
 }; // clang-format on
 
 using model_build_flags = flags<model_build_flag>;

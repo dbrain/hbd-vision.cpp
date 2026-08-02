@@ -1,4 +1,5 @@
 #include "visp/arch/swin.h"
+#include "util/env.h"
 #include "util/string.h"
 #include "visp/nn.h"
 
@@ -13,14 +14,6 @@ tensor mlp(model_ref m, tensor x) {
     x = ggml_gelu_inplace(m, x);
     x = linear(m["fc2"], x);
     return named(m, x);
-}
-
-// Ensures that the tensor's data is not overwritten during computation.
-tensor make_constant(tensor x, tensor_name name) {
-    ggml_set_name(x, name.c_str());
-    ggml_set_input(x);  // allocate at the beginning of the graph buffer
-    ggml_set_output(x); // don't reuse memory for computations
-    return x;
 }
 
 void compute_relative_position_index(span<int32_t> dst, int window_size) {
@@ -255,7 +248,9 @@ swin_result encode(model_ref m, tensor x, swin_params const& p) {
     // conv ran F32 above; cast into F16 here, run the blocks F16 (mul_mat F16 dst +
     // F16 norm/softmax/scale/gelu/add), then cast each output feature back to F32 (the
     // decoder + encode_concat's upscale are F32-only). Near-lossless (F16 store; F32 accum).
-    const bool f16 = getenv("VISP_F16_ENCODER") != nullptr;
+    // CUDA-only: ggml's CPU backend has no F16 GGML_OP_NORM and Vulkan no F16 unary, and both
+    // hard-abort mid-graph rather than falling back.
+    const bool f16 = env_flag("VISP_F16_ENCODER");
     if (f16) {
         m.flags |= model_build_flag::f16_activations;
         x = ggml_cast(m, x, GGML_TYPE_F16);

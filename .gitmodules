@@ -1,3 +1,4 @@
 [submodule "depend/ggml"]
 	path = depend/ggml
-	url = git@github.com:dbrain/ggml.git
+	url = https://github.com/dbrain/ggml.git
+	branch = master

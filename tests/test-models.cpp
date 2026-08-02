@@ -86,6 +86,31 @@ VISP_BACKEND_TEST(test_depth_anything)(backend_type bt) {
     compare_images(name, output, tolerance);
 }
 
+VISP_BACKEND_TEST(test_depth_anything_3)(backend_type bt) {
+    path model_path = test_dir().models / "Depth-Anything-3-Small-F16.gguf";
+    path input_path = test_dir().input / "wardrobe.jpg";
+    std::string suffix = bt == backend_type::cpu ? "-cpu.png" : "-gpu.png";
+    // the GGUF is converted locally and the references are not on the CDN yet
+    if (!exists(model_path) || !exists(test_dir().reference / ("depth-anything-3" + suffix))) {
+        throw test_skip{"Model or reference not available"};
+    }
+
+    backend_device b = backend_init(bt);
+    depthany3_model model = depthany3_load_model(model_path.string().c_str(), b);
+    image_data input = image_load(input_path.string().c_str());
+    depthany3_images result = depthany3_compute(model, input);
+
+    image_data depth = image_normalize(result.depth);
+    image_data confidence = image_normalize(result.confidence);
+
+    float tolerance = bt == backend_type::cpu ? 0.01f : 0.015f;
+    compare_images(
+        "depth-anything-3" + suffix, image_f32_to_u8(depth, image_format::alpha_u8), tolerance);
+    compare_images(
+        "depth-anything-3-conf" + suffix, image_f32_to_u8(confidence, image_format::alpha_u8),
+        tolerance);
+}
+
 VISP_BACKEND_TEST(test_migan)(backend_type bt) {
     path model_path = test_dir().models / "MIGAN-512-places2-F16.gguf";
     path image_path = test_dir().input / "bench-image.jpg";

@@ -403,6 +403,214 @@ def convert_depth_anything(input_filepath: Path, writer: Writer):
 
 
 #
+# Depth-Anything-3
+#
+# depth-anything/DA3-* (ByteDance-Seed/depth-anything-3, Apache-2.0). Verified against
+# DA3-SMALL: 440 stored tensors (446 state_dict entries; safetensors de-duplicates 6 tied
+# LayerNorm params), 0.08B params, config.json `net=vits out_layers=[5,7,9,11] alt_start=4
+# qknorm_start=4 rope_start=4 cat_token=true`, `head=DualDPT dim_in=768 features=64
+# out_channels=[48,96,192,384] output_dim=2`.
+#
+# The checkpoint uses ORIGINAL DINOv2 naming (`patch_embed.proj`, `blocks.N.attn.qkv`,
+# `ls1.gamma`), not the transformers naming convert_depth_anything() requires. The encoder
+# is renamed here to the transformers/HF layout that src/visp/arch/dino.cpp already reads,
+# and the fused qkv is split into three linears, so the DINOv2 graph is reusable as-is for
+# the parts DA3 did not change:
+#
+#   model.backbone.pretrained.patch_embed.proj.W  -> backbone.embeddings.patch_embeddings.projection.W
+#   model.backbone.pretrained.cls_token           -> backbone.embeddings.cls_token
+#   model.backbone.pretrained.pos_embed           -> backbone.embeddings.position_embeddings
+#   model.backbone.pretrained.camera_token        -> backbone.embeddings.camera_token   (DA3 only)
+#   model.backbone.pretrained.blocks.N.norm1/2    -> backbone.encoder.layer.N.norm1/2
+#   model.backbone.pretrained.blocks.N.attn.qkv   -> backbone.encoder.layer.N.attention.attention.{query,key,value}
+#   model.backbone.pretrained.blocks.N.attn.proj  -> backbone.encoder.layer.N.attention.output.dense
+#   model.backbone.pretrained.blocks.N.attn.q_norm-> backbone.encoder.layer.N.attention.attention.q_norm  (DA3 only)
+#   model.backbone.pretrained.blocks.N.attn.k_norm-> backbone.encoder.layer.N.attention.attention.k_norm  (DA3 only)
+#   model.backbone.pretrained.blocks.N.ls1.gamma  -> backbone.encoder.layer.N.layer_scale1.lambda1
+#   model.backbone.pretrained.blocks.N.ls2.gamma  -> backbone.encoder.layer.N.layer_scale2.lambda1
+#   model.backbone.pretrained.blocks.N.mlp.fc1/2  -> backbone.encoder.layer.N.mlp.fc1/2
+#   model.backbone.pretrained.norm                -> backbone.layernorm
+#
+# The DualDPT head, camera decoder and camera encoder keep their upstream names with the
+# `model.` prefix stripped (`head.*`, `cam_dec.*`, `cam_enc.*`). cam_enc.trunk.N gets the
+# same encoder rename so a single ggml transformer-block builder covers both.
+#
+# What the head tensors are for (the next port needs this map):
+#   head.norm                          LayerNorm(768) over the concatenated [local|global] tokens
+#   head.projects.i                    1x1 conv 768 -> out_channels[i], per pyramid stage (NHWC)
+#   head.resize_layers.0/.1            ConvTranspose2d x4 / x2 (stage 0/1 upsample; NCHW kernels)
+#   head.resize_layers.3               conv 3x3 stride 2 (stage 3 downsample); stage 2 is Identity
+#   head.scratch.layerK_rn             3x3 conv out_channels[K-1] -> features, bias-free
+#   head.scratch.refinenetK            DPT top-down fusion, DEPTH branch (K=4 top .. K=1 finest)
+#   head.scratch.refinenetK_aux        same chain, independent weights, RAY branch
+#     .resConfUnit1                    lateral residual unit (absent on refinenet4/4_aux)
+#     .resConfUnit2                    main residual unit; then bilinear upsample, then
+#     .out_conv                        1x1 conv 64->64
+#   head.scratch.output_conv1          3x3 conv 64 -> 32, depth neck (applied inside _fuse)
+#   head.scratch.output_conv2.0/.2     3x3 conv 32->32, then 1x1 conv 32 -> 2 depth logits
+#   head.scratch.output_conv1_aux.L.*  5-conv ray neck per pyramid level L (64->32->64->32->64->32)
+#   head.scratch.output_conv2_aux.L.0  3x3 conv 32->32 \
+#   head.scratch.output_conv2_aux.L.2  LayerNorm(32)    | ray head, level L
+#   head.scratch.output_conv2_aux.L.5  1x1 conv 32 -> 7 /
+#   cam_dec.backbone.0/.2              768->768 Linear + ReLU x2 over the camera token
+#   cam_dec.fc_t / fc_qvec / fc_fov.0  translation(3) / quaternion xyzw(4) / fov h,w(2)
+#
+# Outputs: depth = exp(output_conv2[...,0]), depth_conf = 1+exp(output_conv2[...,1]);
+# ray = output_conv2_aux[-1][...,0:6] (linear), ray_conf = 1+exp(...[...,6]). Camera
+# extrinsics/intrinsics come from cam_dec on the layer-11 camera token (token 0), or from
+# the ray field when use_ray_pose is set. Only aux level 3 is consumed at inference; levels
+# 0-2 of output_conv{1,2}_aux are dead weight kept for fidelity.
+#
+# Patch embedding is a plain 4D Conv2d [384,3,14,14] -> no ggml 4-dimension problem.
+
+
+da3_encoder_renames = [
+    ("patch_embed.proj", "embeddings.patch_embeddings.projection"),
+    ("cls_token", "embeddings.cls_token"),
+    ("camera_token", "embeddings.camera_token"),
+    ("pos_embed", "embeddings.position_embeddings"),
+    ("blocks.", "encoder.layer."),
+    ("attn.proj", "attention.output.dense"),
+    ("attn.q_norm", "attention.attention.q_norm"),
+    ("attn.k_norm", "attention.attention.k_norm"),
+    ("ls1.gamma", "layer_scale1.lambda1"),
+    ("ls2.gamma", "layer_scale2.lambda1"),
+    ("norm.weight", "layernorm.weight"),
+    ("norm.bias", "layernorm.bias"),
+]
+
+
+def da3_rename_encoder(name: str, prefix: str) -> str:
+    name = name.removeprefix(prefix)
+    for old, new in da3_encoder_renames:
+        # norm.weight/norm.bias only ever match the trailing final layer norm: the per-block
+        # norm1/norm2 and q_norm/k_norm were already rewritten or carry a distinguishing prefix
+        if name.startswith(old) or f".{old}" in name:
+            name = name.replace(old, new)
+    return name
+
+
+def da3_split_qkv(name: str, tensor: Tensor, writer: Writer):
+    q, k, v = tensor.chunk(3, dim=0)
+    base = name.replace("attn.qkv", "attention.attention")
+    for part, t in (("query", q), ("key", k), ("value", v)):
+        writer.add_tensor(base.replace("attention.attention", f"attention.attention.{part}"), t)
+
+
+def da3_block_index(key: str) -> int | None:
+    for tag in ("pretrained.blocks.", "cam_enc.trunk."):
+        if tag in key:
+            return int(key.split(tag, 1)[1].split(".", 1)[0])
+    return None
+
+
+def convert_depth_anything_3(input_filepath: Path, writer: Writer, max_blocks: int = -1):
+    import json
+
+    writer.add_license("apache-2.0")
+    writer.set_tensor_layout_default(TensorLayout.nchw)
+
+    config_path = input_filepath.parent / "config.json"
+    if not config_path.exists():
+        raise ValueError(f"config.json not found next to the weights ({config_path})")
+    config = json.loads(config_path.read_text())["config"]
+    net_cfg = config["net"]
+
+    model = load_model(input_filepath)
+    if "model.backbone.pretrained.patch_embed.proj.weight" not in model:
+        raise ValueError("Not a Depth-Anything-3 checkpoint (expected depth_anything_3 naming)")
+
+    # safetensors de-duplicates tied parameters; the ray head shares one LayerNorm across all
+    # pyramid levels, so re-materialize the copies rather than push the aliasing into the loader
+    aux_ln = "model.head.scratch.output_conv2_aux"
+    n_aux_levels = 1 + max(int(k.split(".")[-3]) for k in model if k.startswith(f"{aux_ln}."))
+    for level in range(n_aux_levels):
+        for suffix in ("weight", "bias"):
+            model.setdefault(f"{aux_ln}.{level}.2.{suffix}", model[f"{aux_ln}.0.2.{suffix}"])
+
+    patch = model["model.backbone.pretrained.patch_embed.proj.weight"]
+    embed_dim, _, patch_size, _ = patch.shape
+    n_layers = 1 + max(
+        int(k.split(".")[4]) for k in model if k.startswith("model.backbone.pretrained.blocks.")
+    )
+    q_norm = next(k for k in model if k.endswith("attn.q_norm.weight"))
+    head_dim = model[q_norm].shape[0]
+    n_pos = model["model.backbone.pretrained.pos_embed"].shape[1] - 1
+    pos_grid = round(n_pos**0.5)
+
+    writer.add_int32("dino.patch_size", patch_size)
+    writer.add_int32("dino.embed_dim", embed_dim)
+    writer.add_int32("dino.n_heads", embed_dim // head_dim)
+    writer.add_int32("dino.n_layers", n_layers)
+
+    arch = "depthanything3"
+    writer.add_int32(f"{arch}.image_size", 504)  # api.py inference(process_res=504)
+    writer.add_int32(f"{arch}.image_multiple", patch_size)
+    writer.add_string(f"{arch}.resize_mode", "upper_bound")  # bound the LONGEST side
+    writer.add_int32(f"{arch}.pos_embed_grid", pos_grid)
+    writer.add_array(f"{arch}.feature_layers", net_cfg["out_layers"])
+    writer.add_int32(f"{arch}.alt_start", net_cfg["alt_start"])
+    writer.add_int32(f"{arch}.qknorm_start", net_cfg["qknorm_start"])
+    writer.add_int32(f"{arch}.rope_start", net_cfg["rope_start"])
+    writer.add_float32(f"{arch}.rope_frequency", 100.0)
+    writer.add_bool(f"{arch}.cat_token", net_cfg["cat_token"])
+    writer.add_int32(f"{arch}.patch_start_idx", 1)
+
+    head_cfg = config["head"]
+    out_channels = [model[f"model.head.projects.{i}.weight"].shape[0] for i in range(4)]
+    writer.add_int32(f"{arch}.head_dim_in", model["model.head.norm.weight"].shape[0])
+    writer.add_int32(f"{arch}.head_features", model["model.head.scratch.layer1_rn.weight"].shape[0])
+    writer.add_array(f"{arch}.head_out_channels", out_channels)
+    writer.add_int32(f"{arch}.head_output_dim", head_cfg["output_dim"])
+    writer.add_int32(f"{arch}.head_aux_output_dim", model[f"{aux_ln}.0.5.weight"].shape[0])
+    writer.add_int32(f"{arch}.head_aux_levels", n_aux_levels)
+    writer.add_float32(f"{arch}.head_pos_embed_ratio", 0.1)
+    writer.add_float32(f"{arch}.head_pos_embed_omega", 100.0)
+    writer.add_string(f"{arch}.head_activation", "exp")
+    writer.add_string(f"{arch}.head_conf_activation", "expp1")
+
+    writer.add_int32(f"{arch}.cam_dec_dim", model["model.cam_dec.fc_t.weight"].shape[1])
+    writer.add_int32(f"{arch}.cam_enc_dim", model["model.cam_enc.token_norm.weight"].shape[0])
+    writer.add_int32(
+        f"{arch}.cam_enc_layers",
+        1 + max(int(k.split(".")[3]) for k in model if k.startswith("model.cam_enc.trunk.")),
+    )
+    writer.add_int32(f"{arch}.cam_enc_n_heads", 16)  # CameraEnc default, not derivable from weights
+
+    backbone_prefix = "model.backbone.pretrained."
+    for key in sorted(model.keys()):
+        block = da3_block_index(key)
+        if max_blocks >= 0 and block is not None and block >= max_blocks:
+            continue
+
+        tensor = model[key]
+        if key.startswith(backbone_prefix):
+            name = "backbone." + da3_rename_encoder(key, backbone_prefix)
+        elif key.startswith("model.cam_enc.trunk."):
+            name = "cam_enc." + da3_rename_encoder(key, "model.cam_enc.")
+        else:
+            name = key.removeprefix("model.")
+
+        if "attn.qkv" in name:
+            da3_split_qkv(name, tensor, writer)
+            continue
+
+        if is_conv_2d(name, tensor):
+            if "patch_embeddings" in name or "head.projects" in name:
+                tensor = conv_2d_to_nhwc(tensor)  # 1x1 / patch conv, kept CWHN for mul_mat
+            elif "resize_layers.0" in name or "resize_layers.1" in name:
+                pass  # ConvTranspose2D, don't change layout
+            else:
+                tensor = writer.convert_tensor_2d(tensor)
+
+        if "position_embeddings" in name or "cls_token" in name or "camera_token" in name:
+            writer.add_tensor(name, tensor, "f32")
+            continue
+
+        writer.add_tensor(name, tensor)
+
+
+#
 # MI-GAN
 
 
@@ -462,9 +670,13 @@ arch_names = {
     "sam": "mobile-sam",
     "birefnet": "birefnet",
     "depth-anything": "depthanything",
+    "depth-anything-3": "depthanything3",
     "migan": "migan",
     "esrgan": "esrgan",
 }
+
+# archs that are only ever built and shipped as F16
+f16_only_archs = {"depth-anything-3"}
 
 file_types = {None: 0, "f32": 0, "f16": 1}
 
@@ -479,8 +691,12 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
     parser.add_argument("--model-name", type=str, default=None, help="Name of the model for metadata")
     parser.add_argument("--metadata", type=Path, help="Specify the path for an authorship metadata override file")
+    parser.add_argument("--max-blocks", type=int, default=-1, help="Debug: only convert transformer blocks [0,N); -1=all")
     # fmt: on
     args = parser.parse_args()
+
+    if args.quantize is None and args.arch in f16_only_archs:
+        args.quantize = "f16"
 
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -512,6 +728,8 @@ if __name__ == "__main__":
                 convert_birefnet(input_path, writer)
             case "depthany" | "depth-anything":
                 convert_depth_anything(input_path, writer)
+            case "depth-anything-3":
+                convert_depth_anything_3(input_path, writer, args.max_blocks)
             case "migan":
                 convert_migan(input_path, writer)
             case "esrgan":

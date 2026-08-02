@@ -2,7 +2,7 @@
 # matting_bench.sh — GPU-vs-CPU + resolution + thread-count sweep for BiRefNet
 # background removal (vision.cpp). Two layers:
 #   1. CLI compute timing (pure inference + VRAM, no HTTP)  -> vision-cli birefnet
-#   2. End-to-end server timing (resident/warm) + res sweep -> matting-server /remove
+#   2. End-to-end server timing (resident/warm) + res sweep -> vision-server /remove
 #
 # Requires a built tree (cmake -DVISP_SERVER=ON ...) and a model + test image.
 # Nothing here builds; run it once the device is free.
@@ -23,7 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD="${BUILD:-build}"
 CLI="$BUILD/bin/vision-cli"; [ -x "$CLI" ] || CLI="$BUILD/src/cli/vision-cli"
-SRV="$BUILD/bin/matting-server"; [ -x "$SRV" ] || SRV="$BUILD/src/server/matting-server"
+SRV="$BUILD/bin/vision-server"; [ -x "$SRV" ] || SRV="$BUILD/src/server/vision-server"
 : "${MODEL:?set MODEL=/path/to/model.gguf}"
 # Default to the in-repo fur/edge sample so the bench is turnkey.
 IMG="${IMG:-$SCRIPT_DIR/../tests/input/cat-and-hat.jpg}"
@@ -39,7 +39,7 @@ has_gpu() { command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; }
 
 # VRAM attribution is by PROCESS NAME, not PID — robust when the binary runs
 # inside a container (PID namespace differs from the host nvidia-smi view).
-VRAM_NAME="${VRAM_NAME:-matting-server}"
+VRAM_NAME="${VRAM_NAME:-vision-server}"
 
 # peak VRAM (MiB) for the named process while $1 (a pid) runs
 vram_peak_during() { # $1: pid to watch

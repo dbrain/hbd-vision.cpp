@@ -78,6 +78,21 @@ struct model_funcs<model_family::depth_anything> {
 };
 
 template <>
+struct model_funcs<model_family::depth_anything_3> {
+    using model_t = depthany3_model;
+
+    static depthany3_model load(char const* filepath, backend_device const& dev) {
+        return depthany3_load_model(filepath, dev);
+    }
+    static image_data compute(depthany3_model& m, span<image_view> inputs, span<int>) {
+        expect_images(inputs, 1);
+        depthany3_images result = depthany3_compute(m, inputs[0]);
+        image_data normalized = image_normalize(result.depth);
+        return image_f32_to_u8(normalized, image_format::alpha_u8);
+    }
+};
+
+template <>
 struct model_funcs<model_family::migan> {
     using model_t = migan_model;
 
@@ -112,6 +127,9 @@ void dispatch_model(model_family family, F&& f) {
         case model_family::sam: f(model_funcs<model_family::sam>{}); break;
         case model_family::birefnet: f(model_funcs<model_family::birefnet>{}); break;
         case model_family::depth_anything: f(model_funcs<model_family::depth_anything>{}); break;
+        case model_family::depth_anything_3:
+            f(model_funcs<model_family::depth_anything_3>{});
+            break;
         case model_family::migan: f(model_funcs<model_family::migan>{}); break;
         case model_family::esrgan: f(model_funcs<model_family::esrgan>{}); break;
         default: throw visp::exception("Unsupported model family");

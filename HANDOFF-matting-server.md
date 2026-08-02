@@ -63,10 +63,12 @@ facts. If you change state, update this file.
 ## Other uncommitted edits
 - `src/visp/arch/birefnet.cpp`: 3× `ggml_cont` on decoder residual adds — added during
   early (wrong-site) crash debugging. HARMLESS but not load-bearing; revert when cleaning.
-- `CMakeLists.txt` + `src/server/CMakeLists.txt`: `VISP_SERVER` option + matting-server target.
+- `CMakeLists.txt` + `src/server/CMakeLists.txt`: `VISP_SERVER` option + vision-server target.
 - `include/visp/ml.h`: compute_graph gains cpu_fallback + sched members.
-- `src/server/birefnet_server.cpp`: the HTTP server (untracked). NOTE: has a temp
-  `X-BG-Debug` response header to remove before final.
+- `src/server/`: the HTTP server. `birefnet_server.cpp` was split into
+  `main.cpp` / `matting_endpoints.cpp` / `siglip_endpoints.cpp` / `worker.cpp` /
+  `server_ipc.*` / `server_state.*` when SigLIP2 was folded in, and the target renamed
+  `matting-server` -> `vision-server`. See HANDOFF-siglip2-port.md.
 
 ## Build & run (host has NO cuda/cmake — use the builder image)
 Build (static; shared libggml-cuda fails to link with driver-API undefined refs):
@@ -77,7 +79,7 @@ docker run --rm -v "$HOME/dev/vision.cpp:/src" -v matting-ccache:/root/.ccache \
      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
      -DBUILD_SHARED_LIBS=OFF -DVISP_STATIC_GGML=ON -DVISP_SERVER=ON -DVISP_TESTS=OFF \
      -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DCMAKE_CUDA_ARCHITECTURES=86 && \
-   cmake --build /src/build --target vision-cli matting-server -j"$(nproc)"'
+   cmake --build /src/build --target vision-cli vision-server -j"$(nproc)"'
 ```
 (Incremental: just the last `cmake --build`. ccache relink can serve a stale .o → `touch` the .cpp.)
 Run (GPU; even `-b cpu` needs --gpus all because the binary links cuda):

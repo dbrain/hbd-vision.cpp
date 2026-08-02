@@ -12,6 +12,8 @@ model_family model_detect_family(model_file const& file) {
         return model_family::birefnet;
     } else if (arch == "depthanything") {
         return model_family::depth_anything;
+    } else if (arch == "depthanything3") {
+        return model_family::depth_anything_3;
     } else if (arch == "migan") {
         return model_family::migan;
     } else if (arch == "esrgan") {
@@ -164,6 +166,49 @@ image_data depthany_compute(depthany_model& model, image_view image) {
 
     tensor_data output_data = transfer_from_backend(model.output);
     return depthany_process_output(output_data.as_f32(), image.extent, model.params);
+}
+
+//
+// Depth Anything 3
+
+depthany3_model depthany3_load_model(char const* filepath, backend_device const& dev) {
+    depthany3_model model;
+    model.backend = &dev;
+    model_file file = model_load(filepath);
+    model.params = depthany3_detect_params(file);
+    model.weights = model_init(file.n_tensors());
+    model_transfer(file, model.weights, dev, dev.preferred_float_type(), dev.preferred_layout());
+    return model;
+}
+
+depthany3_images depthany3_compute(depthany3_model& model, image_view image) {
+    i32x2 res = depthany3_image_extent(image.extent, model.params);
+
+    if (!model.graph || res != model.params.image_extent) {
+        model.params.image_extent = res;
+        model.graph = compute_graph_init(4 * 1024);
+
+        model_ref m(model.weights, model.graph);
+        depthany3_buffers buffers = depthany3_precompute(m, model.params);
+        model.input = compute_graph_input(m, GGML_TYPE_F32, {3, res[0], res[1], 1});
+        model.output = depthany3_predict(m, model.input, model.params);
+
+        compute_graph_allocate(model.graph, *model.backend);
+        for (tensor_data const& buf : buffers) {
+            transfer_to_backend(buf);
+        }
+    }
+
+    image_data img_data = depthany3_process_input(image, model.params);
+    transfer_to_backend(model.input, img_data);
+
+    compute(model.graph, *model.backend);
+
+    tensor_data depth = transfer_from_backend(model.output.depth);
+    tensor_data conf = transfer_from_backend(model.output.confidence);
+    return {
+        depthany3_process_output(depth.as_f32(), image.extent, model.params),
+        depthany3_process_output(conf.as_f32(), image.extent, model.params)};
 }
 
 //

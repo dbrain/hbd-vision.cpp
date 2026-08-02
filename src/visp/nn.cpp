@@ -78,6 +78,13 @@ tensor layer_norm(model_ref m, tensor x, float eps) {
     return named(m, x);
 }
 
+tensor make_constant(tensor x, tensor_name name) {
+    ggml_set_name(x, name.c_str());
+    ggml_set_input(x);  // allocate at the beginning of the graph buffer
+    ggml_set_output(x); // don't reuse memory for computations
+    return x;
+}
+
 tensor permute_cwhn_to_whcn(model_ref m, tensor x) {
     return ggml_permute(m, x, 2, 0, 1, 3);
 }
@@ -139,12 +146,6 @@ tensor conv_2d(model_ref m, tensor x, int stride, int pad) {
             x = ggml_reshape_2d(m, x, x->ne[0], w * h * b);
             x = ggml_mul_mat(m, weight, x);
             x = ggml_reshape_4d(m, x, weight->ne[1], w, h, b);
-
-        } else if (m.flags & model_build_flag::conv_2d_direct_cwhn) {
-            weight = permute_cwhn_to_whcn(m, weight);
-            x = permute_cwhn_to_whcn(m, x);
-            x = ggml_conv_2d_direct(m, weight, x, stride, stride, pad, pad, 1, 1);
-            x = permute_whcn_to_cwhn(m, x);
 
         } else {
             // cwhn k>1 conv. weight is cwhn [IC, KW, KH, OC]; x is cwhn [C, W, H, B].

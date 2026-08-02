@@ -89,6 +89,7 @@ enum class model_family {
     depth_anything,
     migan,
     esrgan,
+    depth_anything_3,
 
     count
 };
@@ -252,6 +253,61 @@ VISP_API image_data depthany_process_output(
 VISP_API tensor depthany_predict(model_ref, tensor image, depthany_params const&);
 
 //
+// Depth Anything 3 - depth estimation with per-pixel confidence
+
+struct depthany3_model;
+
+// Raw model output rescaled to the input resolution. Depth is a distance from the camera, not
+// disparity: near is small. Both are unnormalized (depth = exp(logit), confidence = 1 + exp(logit)).
+struct depthany3_images {
+    image_data depth;      // alpha_f32
+    image_data confidence; // alpha_f32
+};
+
+// Loads a Depth Anything 3 model from GGUF file onto the backend device.
+// * supports the DA3-SMALL single-view (monocular) configuration
+VISP_API depthany3_model depthany3_load_model(char const* filepath, backend_device const&);
+
+// Takes RGB input and computes estimated depth together with a confidence map.
+VISP_API depthany3_images depthany3_compute(depthany3_model&, image_view image);
+
+// --- Depth Anything 3 pipeline
+
+struct depthany3_params {
+    int image_size = 504;    // bounds the LONGEST side (unlike Depth Anything V2)
+    int image_multiple = 14;
+    i32x2 image_extent = {504, 504};
+    int pos_embed_grid = 37; // side length of the stored position embedding grid
+    int alt_start = 4;       // first block with camera token + local/global alternation
+    int qknorm_start = 4;
+    int rope_start = 4;
+    float rope_frequency = 100.f;
+    float head_pos_embed_ratio = 0.1f;
+    float head_pos_embed_omega = 100.f;
+    int head_features = 64;
+    std::array<int, 4> head_out_channels = {48, 96, 192, 384};
+    std::array<int, 4> feature_layers = {5, 7, 9, 11};
+    dino_params dino;
+};
+
+struct depthany3_prediction {
+    tensor depth;
+    tensor confidence;
+};
+
+using depthany3_buffers = std::vector<tensor_data>;
+
+VISP_API depthany3_params depthany3_detect_params(model_file const&, i32x2 input_extent = {});
+VISP_API i32x2 depthany3_image_extent(i32x2 input_extent, depthany3_params const&);
+VISP_API depthany3_buffers depthany3_precompute(model_ref, depthany3_params const&);
+
+VISP_API image_data depthany3_process_input(image_view image, depthany3_params const&);
+VISP_API image_data depthany3_process_output(
+    std::span<float const> output_data, i32x2 target_extent, depthany3_params const&);
+
+VISP_API depthany3_prediction depthany3_predict(model_ref, tensor image, depthany3_params const&);
+
+//
 // MI-GAN - image inpainting
 
 struct migan_model;
@@ -344,6 +400,17 @@ struct depthany_model {
     compute_graph graph;
     tensor input = nullptr;
     tensor output = nullptr;
+};
+
+// internal
+struct depthany3_model {
+    backend_device const* backend = nullptr;
+    model_weights weights;
+    depthany3_params params;
+
+    compute_graph graph;
+    tensor input = nullptr;
+    depthany3_prediction output = {};
 };
 
 // internal

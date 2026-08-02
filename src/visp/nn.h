@@ -10,6 +10,9 @@ namespace visp {
 tensor linear(model_ref, tensor x);
 tensor layer_norm(model_ref, tensor x, float eps = 1e-5f);
 
+// Names a pre-computed tensor and ensures its data is not overwritten during computation.
+tensor make_constant(tensor x, tensor_name name);
+
 // Permute between CWHN and WHCN tensor dimension ordering. Does not rewrite tensor data.
 tensor permute_cwhn_to_whcn(model_ref m, tensor x);
 tensor permute_whcn_to_cwhn(model_ref m, tensor x);

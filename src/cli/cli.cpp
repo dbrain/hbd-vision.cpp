@@ -13,7 +13,7 @@
 namespace visp {
 using std::filesystem::path;
 
-enum class cli_command { none, sam, birefnet, depth_anything, migan, esrgan };
+enum class cli_command { none, sam, birefnet, depth_anything, depth_anything_3, migan, esrgan };
 
 struct cli_args {
     cli_command command = cli_command::none;
@@ -38,7 +38,8 @@ Usage: vision-cli <command> [options]
 Commands:
     sam       - MobileSAM image segmentation
     birefnet  - BirefNet background removal
-    depthany  - Depth-Anything depth estimation
+    depthany  - Depth-Anything V2 depth estimation
+    depthany3 - Depth-Anything 3 depth estimation (depth + confidence)
     migan     - MI-GAN inpainting
     esrgan    - ESRGAN/Real-ESRGAN upscaling
 
@@ -57,6 +58,7 @@ Examples:
     vision-cli birefnet -m BiRefNet-F16.gguf -i image.jpg -o mask.png --composite output.png
     vision-cli migan -m MIGAN-F16.gguf -i image.jpg mask.png -o output.png
     vision-cli esrgan -m ESRGAN-x4-F16.gguf -i image.jpg -o upscaled.png
+    vision-cli depthany3 -m Depth-Anything-3-Small-F16.gguf -i image.jpg -o depth.png
 )";
     printf("%s", usage);
 }
@@ -122,6 +124,8 @@ cli_args cli_parse(int argc, char** argv) {
         r.command = cli_command::birefnet;
     } else if (arg1 == "depthany" || arg1 == "depth-anything") {
         r.command = cli_command::depth_anything;
+    } else if (arg1 == "depthany3" || arg1 == "depth-anything-3") {
+        r.command = cli_command::depth_anything_3;
     } else if (arg1 == "migan") {
         r.command = cli_command::migan;
     } else if (arg1 == "esrgan") {
@@ -166,6 +170,7 @@ cli_args cli_parse(int argc, char** argv) {
 void run_sam(cli_args const&);
 void run_birefnet(cli_args const&);
 void run_depth_anything(cli_args const&);
+void run_depth_anything_3(cli_args const&);
 void run_migan(cli_args const&);
 void run_esrgan(cli_args const&);
 
@@ -184,6 +189,7 @@ int main(int argc, char** argv) {
             case cli_command::sam: run_sam(args); break;
             case cli_command::birefnet: run_birefnet(args); break;
             case cli_command::depth_anything: run_depth_anything(args); break;
+            case cli_command::depth_anything_3: run_depth_anything_3(args); break;
             case cli_command::migan: run_migan(args); break;
             case cli_command::esrgan: run_esrgan(args); break;
             case cli_command::none: break;
@@ -518,6 +524,67 @@ void run_depth_anything(cli_args const& args) {
     image_data depth_image = image_f32_to_u8(depth_raw, image_format::alpha_u8);
     image_save(depth_image, args.output);
     printf("-> depth image saved to %s\n", args.output);
+}
+
+//
+// Depth Anything 3
+
+void run_depth_anything_3(cli_args const& args) {
+    backend_device backend = backend_init(args);
+    auto [file, weights] = load_model_weights(
+        args, backend, "Depth-Anything-3-Small-F16.gguf", 0, backend.preferred_layout());
+
+    require_inputs(args.inputs, 1, "<image>");
+    image_data image = image_load(args.inputs[0]);
+    depthany3_params params = depthany3_detect_params(file, image.extent);
+    image_data input_data = depthany3_process_input(image, params);
+
+    i32x2 extent = params.image_extent;
+    printf("- model image size: %d (longest side)\n", params.image_size);
+    printf("- inference image size: %dx%d\n", extent[0], extent[1]);
+
+    compute_graph graph = compute_graph_init(4 * 1024);
+    model_ref m(weights, graph);
+    print_model_flags(m);
+
+    depthany3_buffers buffers = depthany3_precompute(m, params);
+    tensor input = compute_graph_input(m, GGML_TYPE_F32, {3, extent[0], extent[1], 1});
+    depthany3_prediction output = depthany3_predict(m, input, params);
+
+    compute_graph_allocate(graph, backend);
+    transfer_to_backend(input, input_data);
+    for (tensor_data const& buf : buffers) {
+        transfer_to_backend(buf);
+    }
+
+    compute_timed(graph, backend);
+
+    tensor_data depth_data = transfer_from_backend(output.depth);
+    tensor_data conf_data = transfer_from_backend(output.confidence);
+    image_data depth = depthany3_process_output(depth_data.as_f32(), image.extent, params);
+    image_data conf = depthany3_process_output(conf_data.as_f32(), image.extent, params);
+
+    auto range = [](image_view img) {
+        span<float const> v = img.as_floats();
+        auto [lo, hi] = std::minmax_element(v.begin(), v.end());
+        return std::pair{*lo, *hi};
+    };
+    auto [depth_min, depth_max] = range(depth);
+    auto [conf_min, conf_max] = range(conf);
+    printf("- depth range: %.4f .. %.4f\n", depth_min, depth_max);
+    printf("- confidence range: %.4f .. %.4f\n", conf_min, conf_max);
+
+    image_data depth_image = image_f32_to_u8(image_normalize(depth), image_format::alpha_u8);
+    image_save(depth_image, args.output);
+    printf("-> depth image saved to %s\n", args.output);
+
+    path conf_path = path(args.output);
+    conf_path.replace_filename(conf_path.stem().string() + "-confidence" +
+                               conf_path.extension().string());
+    auto conf_path_str = conf_path.generic_string();
+    image_data conf_image = image_f32_to_u8(image_normalize(conf), image_format::alpha_u8);
+    image_save(conf_image, conf_path_str.c_str());
+    printf("-> confidence image saved to %s\n", conf_path_str.c_str());
 }
 
 //

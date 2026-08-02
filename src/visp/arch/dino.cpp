@@ -28,7 +28,7 @@ tensor interpolate_pos_encoding(model_ref m, tensor x, int64_t w, int64_t h, int
     return concat(m, {class_embed, patch_embed}, 1);
 }
 
-tensor prepare_tokens(model_ref m, tensor x, int patch_size) {
+tensor prepare_tokens(model_ref m, tensor x, int patch_size, tensor pos_encoding) {
     auto [c, w, h, n] = nelements(x);
     x = patch_embed(m["patch_embeddings"], x, patch_size);
     x = ggml_reshape_3d(m, x, x->ne[0], x->ne[1] * x->ne[2], x->ne[3]);
@@ -39,7 +39,8 @@ tensor prepare_tokens(model_ref m, tensor x, int patch_size) {
     }
     x = concat(m, {cls_token, x}, 1);
 
-    tensor pos_enc = interpolate_pos_encoding(m, x, w, h, patch_size);
+    tensor pos_enc = pos_encoding ? pos_encoding
+                                  : interpolate_pos_encoding(m, x, w, h, patch_size);
     x = ggml_add_inplace(m, x, pos_enc);
     return x;
 }
@@ -55,7 +56,22 @@ tensor mlp(model_ref m, tensor x) {
     return x;
 }
 
-tensor self_attention(model_ref m, tensor x, int n_heads) {
+// 2D RoPE: the first half of each head's features is rotated by the token's y coordinate,
+// the second half by x. Both halves use split-half (NeoX) pair ordering.
+tensor rope_2d(model_ref m, tensor x, block_params const& bp) {
+    int64_t half = x->ne[0] / 2;
+    auto rope = [&](tensor t, tensor pos) {
+        t = ggml_cont(m, t);
+        return ggml_rope_ext(
+            m, t, pos, nullptr, int(half), GGML_ROPE_TYPE_NEOX, 0, bp.rope_frequency, 1.f, 0.f,
+            1.f, 0.f, 0.f);
+    };
+    tensor y_half = rope(slice(m, x, {0, half}), bp.rope_pos_y);
+    tensor x_half = rope(slice(m, x, {half, x->ne[0]}), bp.rope_pos_x);
+    return ggml_concat(m, y_half, x_half, 0);
+}
+
+tensor self_attention(model_ref m, tensor x, int n_heads, block_params const& bp) {
     auto [c, n, b, _] = nelements(x);
     auto project = [&](model_ref m, tensor t) {
         t = linear(m, t);
@@ -67,15 +83,24 @@ tensor self_attention(model_ref m, tensor x, int n_heads) {
     tensor k = project(m["attention.key"], x);
     tensor v = project(m["attention.value"], x);
 
+    if (bp.qk_norm) {
+        q = layer_norm(m["attention.q_norm"], q);
+        k = layer_norm(m["attention.k_norm"], k);
+    }
+    if (bp.rope_pos_y && bp.rope_pos_x) {
+        q = rope_2d(m, q, bp);
+        k = rope_2d(m, k, bp);
+    }
+
     float scale = 1.0f / std::sqrt(float(c) / float(n_heads));
     x = attention(m, q, k, v, nullptr, scale, m["output.dense"]);
     return x;
 }
 
-tensor layer(model_ref m, tensor x, dino_params const& p) {
+tensor layer(model_ref m, tensor x, dino_params const& p, block_params const& bp) {
     tensor attn = x;
     attn = layer_norm(m["norm1"], attn, 1e-6f);
-    attn = self_attention(m["attention"], attn, p.n_heads);
+    attn = self_attention(m["attention"], attn, p.n_heads, bp);
     attn = layer_scale(m["layer_scale1"], attn);
     x = ggml_add(m, x, attn);
 

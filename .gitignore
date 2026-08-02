@@ -21,3 +21,8 @@ __pycache__
 
 # Don't sync Python dependencies for now, latest versions should work
 uv.lock
+# SigLIP2 conversion scaffolding (see HANDOFF-siglip2-port.md)
+.venv-siglip
+.siglip2-stage
+*.model
+build*/

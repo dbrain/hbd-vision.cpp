@@ -1,4 +1,5 @@
 #include "visp/ml.h"
+#include "util/env.h"
 #include "util/string.h"
 #include "visp/platform.h"
 
@@ -188,21 +189,15 @@ void backend_set_n_threads(backend_device& b, int n_threads) {
 // model_build_flags
 
 model_build_flags flash_attn_flag(bool default_enabled) {
-    static char const* const env = getenv("VISP_FLASH_ATTENTION");
-    if (env && env[0] == '1') {
-        return model_build_flag::flash_attention;
-    } else if (env && env[0] == '0') {
-        return model_build_flags{};
-    }
-    return default_enabled ? model_build_flag::flash_attention : model_build_flags{};
+    return env_flag("VISP_FLASH_ATTENTION", default_enabled) ? model_build_flag::flash_attention
+                                                             : model_build_flags{};
 }
 
 model_build_flags backend_default_flags(backend_type type) {
     using enum model_build_flag;
     switch (type) {
         case backend_type::cpu:
-            return conv_2d_direct_cwhn | concat_n | f16_conv_transpose | window_partition |
-                flash_attn_flag(false);
+            return f16_conv_transpose | window_partition | flash_attn_flag(false);
         case backend_type::gpu:
         case backend_type::vulkan: return flash_attn_flag(true);
     }
@@ -865,15 +860,11 @@ tensor slice(model_ref const& m, tensor x, slice_t s0, slice_t s1, slice_t s2, s
 
 tensor concat(model_ref const& m, std::array<tensor, GGML_MAX_SRC> src, int dim) {
     int n = (int)std::count_if(src.begin(), src.end(), [](tensor t) { return t != nullptr; });
-    if (m.flags & model_build_flag::concat_n) {
-        return ggml_concat_n(m, src.data(), n, dim);
-    } else {
-        tensor x = src[0];
-        for (int i = 1; i < n; ++i) {
-            x = ggml_concat(m, x, src[i], dim);
-        }
-        return x;
+    tensor x = src[0];
+    for (int i = 1; i < n; ++i) {
+        x = ggml_concat(m, x, src[i], dim);
     }
+    return x;
 }
 
 tensor interpolate(model_ref const& m, tensor x, i64x2 target, int32_t mode) {

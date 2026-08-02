@@ -12,7 +12,7 @@ option(VISP_INSTALL_MODELS "Download and install default models" ${VISP_PACKAGE}
 option(VISP_FMT_LIB "Use external fmt library instead of standard C++ <format>" OFF)
 option(VISP_STATIC_GGML "Force static build of ggml" OFF)
 option(VISP_ASAN "Enable AddressSanitizer" OFF)
-option(VISP_SERVER "Build the matting HTTP server" OFF)
+option(VISP_SERVER "Build the vision HTTP server (matting + siglip2)" OFF)
 
 include(GNUInstallDirs)
 set(VISP_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header files")
@@ -149,6 +149,7 @@ add_subdirectory(src/visp)
 add_subdirectory(src/cli)
 
 if(VISP_SERVER)
+  add_subdirectory(src/siglip2)
   add_subdirectory(src/server)
 endif()
 

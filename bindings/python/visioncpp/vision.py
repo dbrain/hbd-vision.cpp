@@ -81,7 +81,8 @@ class Arch(Enum):
     depth_anything = 2
     migan = 3
     esrgan = 4
-    unknown = 5
+    depth_anything_3 = 5
+    unknown = 6
 
 
 class Model:
