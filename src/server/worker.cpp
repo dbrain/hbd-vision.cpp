@@ -62,16 +62,55 @@ struct WorkerModels {
     std::unique_ptr<siglip2::Tokenizer> siglip_tokenizer;
 
     // sam3.cpp picks its own ggml backend rather than sharing `device`, so it is
-    // told cpu-or-not and finds the device itself.
+    // told cpu-or-not and finds the device itself. It computes on that one
+    // backend with no ggml_backend_sched, so an op it cannot run aborts the
+    // worker rather than falling back — the rewrites that close those gaps live
+    // in depend/sam3/sam3.cpp and gate on ggml_backend_supports_op().
     std::shared_ptr<sam3_model> sam3;
     sam3_state_ptr sam3_state;
     int sam3_threads = 0;
     bool sam3_use_gpu = false;
 
+    // ── Peer eviction ────────────────────────────────────────────────────
+    //
+    // RMBG (~1.4 GiB resident at 1024) and SAM 3 (~1.9 GiB at q8_0) are the two
+    // heavyweights, and nothing needs both in the same request — /remove and
+    // /parts are separate calls. Holding both makes the worker's peak the SUM of
+    // two models that are never used together, which is what the gate has to
+    // reserve. So they evict each other, and the worker survives: the next call
+    // to the evicted family pays a reload (~0.6 s for SAM 3 q8_0 off page cache)
+    // rather than a full worker respawn.
+    //
+    // Depth (DA2, ~50 MB) is deliberately exempt — it is too small to be worth
+    // a reload, and /depth and /remove genuinely do get called back to back.
+    //
+    // Note this frees the ggml backend buffers; ggml's CUDA allocator may keep
+    // the pages in its pool rather than returning them to the driver, so
+    // nvidia-smi need not drop immediately. What it does guarantee is that the
+    // two models never stack, so the peak stops being additive.
+    void unload_matting() {
+        if (!matting) {
+            return;
+        }
+        matting.reset();
+        matting_native_size = 0;
+        fprintf(stderr, "[vision-worker] evicted matting\n");
+    }
+
+    void unload_sam3() {
+        if (!sam3 && !sam3_state) {
+            return;
+        }
+        sam3_state.reset();  // holds the compute arena — must go before the model
+        sam3.reset();
+        fprintf(stderr, "[vision-worker] evicted sam3\n");
+    }
+
     void load_matting() {
         if (matting || cfg.matting_model.empty()) {
             return;
         }
+        unload_sam3();
         matting = std::make_unique<birefnet_model>(
             birefnet_load_model(cfg.matting_model.c_str(), *device));
         matting_native_size = matting->params.image_size;
@@ -143,10 +182,29 @@ struct WorkerModels {
         if (cfg.sam3_model.empty()) {
             throw except("sam3 model not configured (SAM3_MODEL_PATH / --sam3-model)");
         }
+        unload_matting();
+        // /parts is the only sam3 consumer here and it is promptable *concept*
+        // segmentation — this process never tracks, so the tracker neck the
+        // encode graph would otherwise build is dead work (~100 MiB and ~5% of
+        // encode). Respect an explicit setting if the deployment has one.
+        if (!getenv("SAM3_PCS_ONLY")) {
+            setenv("SAM3_PCS_ONLY", "1", 0);
+        }
+
         sam3_params p;
         p.model_path = cfg.sam3_model;
-        p.use_gpu = sam3_use_gpu;
+        // SAM3_FORCE_CPU pins /parts to CPU without moving the worker, which is
+        // how the GPU-vs-CPU parity run is done.
+        p.use_gpu = sam3_use_gpu && !getenv("SAM3_FORCE_CPU");
         p.n_threads = sam3_threads;
+        // Encode grid override. SAM 3 resizes every input to a fixed grid
+        // (1008/14 = 72), and cost scales with its area, so this is the biggest
+        // speed/VRAM knob there is. Must be a multiple of 336 (24 patches) or
+        // the pretrained pos_embed cannot tile it — sam3_create_state rejects
+        // anything else rather than producing quiet nonsense.
+        if (const char* e = getenv("SAM3_ENCODE_IMG_SIZE")) {
+            p.encode_img_size = atoi(e);
+        }
         sam3 = sam3_load_model(p);
         if (!sam3) {
             throw except("sam3 load failed: {}", cfg.sam3_model);
